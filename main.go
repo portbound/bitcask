@@ -1,26 +1,39 @@
 package main
 
 import (
+	"encoding/binary"
+	"hash/crc32"
 	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 )
 
-const MaxFileSize = uint64(255 * 1024 * 1024)
+const MaxFileSize = uint64(2 * 1024 * 1024 * 1024)
 
 type Bitcask struct {
-	mu       sync.RWMutex
-	size     uint64
-	datafile *os.File
-	lock     *os.File
-	keyDir   map[uint8]struct {
-		fileId    uint8
-		valueSize uint8
-		valuePos  uint8
-		timestamp uint32
-	}
+	root      string
+	mu        sync.RWMutex
+	sizeLimit uint64
+	datafile  *os.File
+	lock      *os.File
+	// keyDir    map[uint8]struct {
+	// 	fileId    uint8
+	// 	valueSize uint8
+	// 	valuePos  uint8
+	// 	timestamp uint32
+	// }
+}
+
+type record struct {
+	crc       uint32
+	tstamp    uint32
+	keySize   uint32
+	valueSize uint32
+	key       []byte
+	value     []byte
 }
 
 func NewBitcask(path string) (*Bitcask, error) {
@@ -53,14 +66,74 @@ func NewBitcask(path string) (*Bitcask, error) {
 	}
 
 	return &Bitcask{
-		size:     0,
-		datafile: datafile,
-		lock:     lock,
+		mu:        sync.RWMutex{},
+		sizeLimit: 0,
+		datafile:  datafile,
+		lock:      lock,
 	}, nil
 }
 
 func (b *Bitcask) Write(k, v []byte) error {
+	// attempt to aquire mu (timeout probably needed)
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
+	// build record
+	r := &record{
+		tstamp:    uint32(time.Now().Unix()),
+		keySize:   uint32(len(k)),
+		valueSize: uint32(len(v)),
+		// key:       k,
+		// value:     v,
+	}
+
+	var buf []byte
+	buf, err := binary.Append(buf, binary.BigEndian, r)
+	if err != nil {
+		return err
+	}
+
+	buf2 := make([]byte, r.keySize)
+	buf2 = k
+	buf = append(buf, buf2...)
+
+	buf3 := make([]byte, r.valueSize)
+	buf3 = v
+	buf = append(buf, buf3...)
+
+	// // sign checksum
+	r.crc = crc32.ChecksumIEEE(buf)
+
+	// buf, err := json.Marshal(r)
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	//
+	// // convert final record to byte slice
+	// buf2, err := json.Marshal(r)
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	// fileInfo, err := b.datafile.Stat()
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	// // rotate datafile if necessary
+	// if (uint64(fileInfo.Size()) + uint64(len(buf2))) > MaxFileSize {
+	// 	err := rotateDataFile()
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// }
+	//
+	// _, err = b.datafile.Write(buf2)
+	// if err != nil {
+	// 	return err
+	// }
+	//
 	return nil
 }
 
@@ -75,6 +148,10 @@ func (b *Bitcask) sync() error {
 
 func (b *Bitcask) merge() error {
 	return nil
+}
+
+func rotateDataFile() error {
+	panic("unimplemented")
 }
 
 func main() {
