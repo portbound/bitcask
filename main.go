@@ -15,10 +15,11 @@ const MaxFileSize = uint64(2 * 1024 * 1024 * 1024)
 
 type Bitcask struct {
 	root      string
-	mu        sync.RWMutex
-	sizeLimit uint64
-	datafile  *os.File
 	lock      *os.File
+	mu        sync.RWMutex
+	datafile  *os.File
+	sizeLimit uint64
+	writePos  uint64
 	// keyDir    map[uint8]struct {
 	// 	fileId    uint8
 	// 	valueSize uint8
@@ -45,20 +46,27 @@ func NewBitcask(path string) (*Bitcask, error) {
 	}
 
 	// create datafile
-	datafilePath := filepath.Join(dir, ".datafile")
-	datafile, err := os.Create(datafilePath)
+	// TODO not sure what naming convention I want to use. If I go with numbers, I need to handle autoincrement. If I go with hashes, I need to ensure they're unique.
+	datafilePath := filepath.Join(dir, "001.datafile")
+	datafile, err := os.OpenFile(datafilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
 
-	// create lock file
+	// get new file FileInfo
+	stat, err := datafile.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	// create bitcask file lock
 	lockPath := filepath.Join(dir, ".lock")
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
 
-	// aquire lock
+	// aquire bitcask file lock
 	err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		lock.Close()
@@ -66,10 +74,11 @@ func NewBitcask(path string) (*Bitcask, error) {
 	}
 
 	return &Bitcask{
-		mu:        sync.RWMutex{},
-		sizeLimit: 0,
-		datafile:  datafile,
 		lock:      lock,
+		mu:        sync.RWMutex{},
+		sizeLimit: MaxFileSize,
+		writePos:  uint64(stat.Size()),
+		datafile:  datafile,
 	}, nil
 }
 
