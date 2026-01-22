@@ -73,73 +73,61 @@ func NewBitcask(path string) (*Bitcask, error) {
 	}, nil
 }
 
-func (b *Bitcask) Write(k, v []byte) error {
-	// attempt to aquire mu (timeout probably needed)
+func (b *Bitcask) Put(k, v []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// build record
-	r := &record{
-		tstamp:    uint32(time.Now().Unix()),
-		keySize:   uint32(len(k)),
-		valueSize: uint32(len(v)),
-		// key:       k,
-		// value:     v,
+	record := encodeRecord(k, v)
+
+	if (b.writePos + uint64(len(record))) > b.sizeLimit {
+		err := rotateDataFile()
+		if err != nil {
+			return err
+		}
 	}
 
-	var buf []byte
-	buf, err := binary.Append(buf, binary.BigEndian, r)
+	n, err := b.datafile.Write(record)
 	if err != nil {
 		return err
 	}
 
-	buf2 := make([]byte, r.keySize)
-	buf2 = k
-	buf = append(buf, buf2...)
+	b.writePos += uint64(n)
 
-	buf3 := make([]byte, r.valueSize)
-	buf3 = v
-	buf = append(buf, buf3...)
-
-	// // sign checksum
-	r.crc = crc32.ChecksumIEEE(buf)
-
-	// buf, err := json.Marshal(r)
-	// if err != nil {
-	// 	return err
-	// }
-	//
-	//
-	// // convert final record to byte slice
-	// buf2, err := json.Marshal(r)
-	// if err != nil {
-	// 	return err
-	// }
-	//
-	// fileInfo, err := b.datafile.Stat()
-	// if err != nil {
-	// 	return err
-	// }
-	//
-	// // rotate datafile if necessary
-	// if (uint64(fileInfo.Size()) + uint64(len(buf2))) > MaxFileSize {
-	// 	err := rotateDataFile()
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// }
-	//
-	// _, err = b.datafile.Write(buf2)
-	// if err != nil {
-	// 	return err
-	// }
-	//
 	return nil
 }
 
 func (b *Bitcask) Delete(k []byte) error {
 	var v []byte
-	return b.Write(k, v)
+	return b.Put(k, v)
+}
+
+func encodeRecord(k, v []byte) []byte {
+	tstamp := uint32(time.Now().Unix())
+	keySize := uint32(len(k))
+	valueSize := uint32(len(v))
+
+	recordSize := 16 + len(k) + len(v)
+	buf := make([]byte, recordSize)
+
+	offset := 4
+	binary.BigEndian.PutUint32(buf[offset:], tstamp)
+	offset += 4
+	binary.BigEndian.PutUint32(buf[offset:], keySize)
+	offset += 4
+	binary.BigEndian.PutUint32(buf[offset:], valueSize)
+	offset += 4
+	copy(buf[offset:], k)
+	offset += len(k)
+	copy(buf[offset:], v)
+
+	checksum := crc32.ChecksumIEEE(buf[4:])
+	binary.BigEndian.PutUint32(buf[0:4], checksum)
+
+	return buf
+}
+
+func rotateDataFile() error {
+	panic("unimplemented")
 }
 
 func (b *Bitcask) sync() error {
@@ -148,10 +136,6 @@ func (b *Bitcask) sync() error {
 
 func (b *Bitcask) merge() error {
 	return nil
-}
-
-func rotateDataFile() error {
-	panic("unimplemented")
 }
 
 func main() {
