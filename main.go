@@ -86,7 +86,8 @@ func (b *Bitcask) Put(k, v []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	record := encodeRecord(k, v)
+	tstamp := uint32(time.Now().Unix())
+	record := encodeRecord(k, v, tstamp)
 
 	if (b.writePos + uint64(len(record))) > b.sizeLimit {
 		err := rotateDataFile()
@@ -110,20 +111,19 @@ func (b *Bitcask) Delete(k []byte) error {
 	return b.Put(k, v)
 }
 
-func encodeRecord(k, v []byte) []byte {
-	tstamp := uint32(time.Now().Unix())
-	keySize := uint32(len(k))
-	valueSize := uint32(len(v))
+func encodeRecord(k, v []byte, tstamp uint32) []byte {
+	keyLen := uint32(len(k))
+	valueLen := uint32(len(v))
 
-	recordSize := 16 + len(k) + len(v)
-	buf := make([]byte, recordSize)
+	buf := make([]byte, 16+len(k)+len(v))
 
+	// pad start by 4 bytes to save room for the checksum
 	offset := 4
 	binary.BigEndian.PutUint32(buf[offset:], tstamp)
 	offset += 4
-	binary.BigEndian.PutUint32(buf[offset:], keySize)
+	binary.BigEndian.PutUint32(buf[offset:], keyLen)
 	offset += 4
-	binary.BigEndian.PutUint32(buf[offset:], valueSize)
+	binary.BigEndian.PutUint32(buf[offset:], valueLen)
 	offset += 4
 	copy(buf[offset:], k)
 	offset += len(k)
