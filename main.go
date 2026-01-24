@@ -28,15 +28,6 @@ type Bitcask struct {
 	// }
 }
 
-type record struct {
-	crc       uint32
-	tstamp    uint32
-	keySize   uint32
-	valueSize uint32
-	key       []byte
-	value     []byte
-}
-
 func NewBitcask(path string) (*Bitcask, error) {
 	const dir = "bitcask"
 
