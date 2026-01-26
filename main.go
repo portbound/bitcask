@@ -20,16 +20,18 @@ type Bitcask struct {
 	datafile  *os.File
 	sizeLimit uint64
 	writePos  uint64
-	// keyDir    map[uint8]struct {
-	// 	fileId    uint8
-	// 	valueSize uint8
-	// 	valuePos  uint8
-	// 	timestamp uint32
-	// }
+	keyDir    map[uint64]*keyDirVal
+}
+
+type keyDirVal struct {
+	fileId    uint8
+	valueSize uint32
+	valuePos  uint32
+	tstamp    uint32
 }
 
 func NewBitcask(path string) (*Bitcask, error) {
-	const dir = "bitcask"
+	dir := filepath.Join(path, "bitcask")
 
 	// create bitcask dir
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -80,6 +82,7 @@ func (b *Bitcask) Put(k, v []byte) error {
 	tstamp := uint32(time.Now().Unix())
 	record := encodeRecord(k, v, tstamp)
 
+	// rotate datafile if post write size would exceed file size limit
 	if (b.writePos + uint64(len(record))) > b.sizeLimit {
 		err := rotateDataFile()
 		if err != nil {
@@ -87,17 +90,31 @@ func (b *Bitcask) Put(k, v []byte) error {
 		}
 	}
 
+	// write to datafile
 	n, err := b.datafile.Write(record)
 	if err != nil {
 		return err
 	}
 
+	// increment write position by length of bytes written
 	b.writePos += uint64(n)
+
+	// TODO not sure how we want to handle this... in the event that our key is under 8 bytes, we may need to pad the key with zeroesbut I'm not sure how this will affect reading the key... I think it will be okay, but maybe we should test. This is also only for the in memory keyDir buffer, so this could get quite large
+	foo := binary.BigEndian.Uint64(k)
+	b.keyDir[foo] = &keyDirVal{
+		// need to figure out what to use for a 'fileId' - this needs to be fixed length...
+		// fileId:    b.datafile,
+		valueSize: uint32(len(v)),
+		valuePos:  uint32(b.writePos - (uint64(n) + 1)), // this should work? Since we're just appending binary to a file, taking a snapshot of the write position should tell us where the key starts
+		tstamp:    tstamp,
+	}
 
 	return nil
 }
 
 func (b *Bitcask) Delete(k []byte) error {
+	// using an empty value as a tombstone value
+	// during merge, any key that has a tombstone value as the most recent record is deleted
 	var v []byte
 	return b.Put(k, v)
 }
@@ -127,7 +144,8 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 }
 
 func rotateDataFile() error {
-	panic("unimplemented")
+	// lock the current
+	return nil
 }
 
 func (b *Bitcask) sync() error {
