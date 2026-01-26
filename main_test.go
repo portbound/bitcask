@@ -16,7 +16,7 @@ func Test_encodeRecord(t *testing.T) {
 		want []byte
 	}{
 		{
-			name: "valid",
+			name: "passing",
 			k:    []byte("key"),
 			v:    []byte("value"),
 			want: func() []byte {
@@ -47,6 +47,41 @@ func Test_encodeRecord(t *testing.T) {
 			got := encodeRecord(tt.k, tt.v, testTimestamp)
 			if !bytes.Equal(got, tt.want) {
 				t.Errorf("expected byte slice equality, got:%v want%v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBitcask_Put(t *testing.T) {
+	tests := []struct {
+		name    string
+		k       []byte
+		v       []byte
+		wantErr bool
+	}{
+		{
+			name:    "passing",
+			k:       []byte("key"),
+			v:       []byte("value"),
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, err := NewBitcask(t.TempDir())
+			if err != nil {
+				t.Fatalf("could not construct receiver type: %v", err)
+			}
+			gotErr := b.Put(tt.k, tt.v)
+			if gotErr != nil {
+				if !tt.wantErr {
+					t.Errorf("Put() failed: %v", gotErr)
+				}
+				return
+			}
+			if tt.wantErr {
+				t.Fatal("Put() succeeded unexpectedly")
 			}
 		})
 	}
