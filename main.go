@@ -48,6 +48,8 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 		return nil, err
 	}
 
+	fileId := fmt.Sprintf("%04d.dat", 1)
+
 	// create datafile
 	datafilePath := filepath.Join(dir, fileId)
 	datafile, err := os.OpenFile(datafilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
@@ -56,6 +58,7 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 	}
 
 	// get new file FileInfo
+
 	stat, err := datafile.Stat()
 	if err != nil {
 		return nil, err
@@ -85,12 +88,12 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 	}, nil
 }
 
-func (b *Bitcask) Put(k, v []byte) error {
+func (b *Bitcask) Put(key, value []byte) error {
+	tstamp := uint32(time.Now().Unix())
+	record := encodeRecord(key, value, tstamp)
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	tstamp := uint32(time.Now().Unix())
-	record := encodeRecord(k, v, tstamp)
 
 	// rotate datafile if post write size would exceed file size limit
 	if (b.writePos + uint64(len(record))) > b.sizeLimit {
@@ -98,6 +101,19 @@ func (b *Bitcask) Put(k, v []byte) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// strip .dat file extension and convert to int
+	fileID, err := strconv.Atoi(strings.TrimRight(filepath.Base(b.datafile.Name()), ".dat"))
+	if err != nil {
+		return err
+	}
+
+	kmv := keyMapValue{
+		fileId:    uint16(fileID),
+		valueSize: uint32(len(value)),
+		valuePos:  uint32(b.writePos - uint64(len(value))),
+		tstamp:    tstamp,
 	}
 
 	// write to datafile
@@ -109,15 +125,8 @@ func (b *Bitcask) Put(k, v []byte) error {
 	// increment write position by length of bytes written
 	b.writePos += uint64(n)
 
-	// TODO not sure how we want to handle this... in the event that our key is under 8 bytes, we may need to pad the key with zeroesbut I'm not sure how this will affect reading the key... I think it will be okay, but maybe we should test. This is also only for the in memory keyDir buffer, so this could get quite large
-	foo := binary.BigEndian.Uint64(k)
-	b.keyDir[foo] = &keyDirVal{
-		// need to figure out what to use for a 'fileId' - this needs to be fixed length...
-		// fileId:    b.datafile,
-		valueSize: uint32(len(v)),
-		valuePos:  uint32(b.writePos - (uint64(n) + 1)), // this should work? Since we're just appending binary to a file, taking a snapshot of the write position should tell us where the key starts
-		tstamp:    tstamp,
-	}
+	// update keyMap
+	b.keyMap[string(key)] = &kmv
 
 	return nil
 }
@@ -126,19 +135,14 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	// Don't really like this. The key is padded, so we need to do this, but it's the same code as seen in Put() and it has a weird smell to it. I think there's a better way to do this. 
-	buf := make([]byte, 8)
-	copy(buf, key)
-	paddedKey := binary.BigEndian.Uint64(buf)
-
-	kmv, ok := b.keyMap[paddedKey]
+	kmv, ok := b.keyMap[string(key)]
 	if !ok {
 		return nil, nil // not sure if this is idiomatic
 	}
 
 	// open file for reading
 	buf2 := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf2, kmv.fileId)
+	binary.BigEndian.PutUint16(buf2, kmv.fileId)
 	file, err := os.Open(string(buf2))
 	if err != nil {
 		return nil, err
