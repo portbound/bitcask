@@ -112,6 +112,43 @@ func (b *Bitcask) Put(k, v []byte) error {
 	return nil
 }
 
+func (b *Bitcask) Get(key []byte) ([]byte, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	// Don't really like this. The key is padded, so we need to do this, but it's the same code as seen in Put() and it has a weird smell to it. I think there's a better way to do this. 
+	buf := make([]byte, 8)
+	copy(buf, key)
+	paddedKey := binary.BigEndian.Uint64(buf)
+
+	kmv, ok := b.keyMap[paddedKey]
+	if !ok {
+		return nil, nil // not sure if this is idiomatic
+	}
+
+	// open file for reading
+	buf2 := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf2, kmv.fileId)
+	file, err := os.Open(string(buf2))
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = file.Seek(int64(kmv.valuePos), io.SeekStart)
+	if err != nil {
+		return nil, err
+	}
+
+	buf3 := make([]byte, kmv.valueSize)
+	_, err = file.Read(buf3)
+	if err != nil {
+		return nil, err
+	}
+
+	bytes.TrimRight(buf3, "\x00") // since the value is of fixed length, we need to trim the trailing empty bytes
+	return buf3, nil
+}
+
 func (b *Bitcask) Delete(k []byte) error {
 	// using an empty value as a tombstone value
 	// during merge, any key that has a tombstone value as the most recent record is deleted
