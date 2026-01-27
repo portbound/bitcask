@@ -16,7 +16,6 @@ import (
 	"time"
 )
 
-const BitcaskFileExt = ".data"
 const DefaultFileSize = uint64(2 * 1024 * 1024 * 1024)
 
 type Bitcask struct {
