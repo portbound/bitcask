@@ -11,7 +11,8 @@ import (
 	"time"
 )
 
-const MaxFileSize = uint64(2 * 1024 * 1024 * 1024)
+const BitcaskFileExt = ".data"
+const DefaultFileSize = uint64(2 * 1024 * 1024 * 1024)
 
 type Bitcask struct {
 	root      string
@@ -20,11 +21,11 @@ type Bitcask struct {
 	datafile  *os.File
 	sizeLimit uint64
 	writePos  uint64
-	keyDir    map[uint64]*keyDirVal
+	keyMap    map[string]*keyMapValue
 }
 
-type keyDirVal struct {
-	fileId    uint8
+type keyMapValue struct {
+	fileId    uint16
 	valueSize uint32
 	valuePos  uint32
 	tstamp    uint32
@@ -39,8 +40,7 @@ func NewBitcask(path string) (*Bitcask, error) {
 	}
 
 	// create datafile
-	// TODO not sure what naming convention I want to use. If I go with numbers, I need to handle autoincrement. If I go with hashes, I need to ensure they're unique.
-	datafilePath := filepath.Join(dir, "001.datafile")
+	datafilePath := filepath.Join(dir, fileId)
 	datafile, err := os.OpenFile(datafilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
@@ -69,9 +69,10 @@ func NewBitcask(path string) (*Bitcask, error) {
 	return &Bitcask{
 		lock:      lock,
 		mu:        sync.RWMutex{},
-		sizeLimit: MaxFileSize,
+		sizeLimit: DefaultFileSize,
 		writePos:  uint64(stat.Size()),
 		datafile:  datafile,
+		keyMap:    make(map[string]*keyMapValue),
 	}, nil
 }
 
