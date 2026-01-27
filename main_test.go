@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
+	"os"
 	"testing"
 )
 
@@ -82,6 +83,50 @@ func TestBitcask_Put(t *testing.T) {
 			}
 			if tt.wantErr {
 				t.Fatal("Put() succeeded unexpectedly")
+			}
+		})
+	}
+}
+
+func TestBitcask_Get(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     []byte
+		want    []byte
+		wantErr bool
+	}{
+		{
+			name:    "passing",
+			key:     []byte("key"),
+			want:    []byte("value"),
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := "/home/portbound/projects/bitcask/testing"
+			b, err := NewBitcask(tmp)
+			if err != nil {
+				t.Fatalf("could not construct receiver type: %v", err)
+			}
+			defer os.Remove(tmp)
+
+			err = b.Put([]byte("key"), []byte("value"))
+			if err != nil {
+				t.Fatalf("failed to initialize bitcask with dummy data")
+			}
+			got, gotErr := b.Get(tt.key)
+			if gotErr != nil {
+				if !tt.wantErr {
+					t.Errorf("Get() failed: %v", gotErr)
+				}
+				return
+			}
+			if tt.wantErr {
+				t.Fatal("Get() succeeded unexpectedly")
+			}
+			if true {
+				t.Errorf("Get() = %v, want %v", got, tt.want)
 			}
 		})
 	}
