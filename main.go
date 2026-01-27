@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -32,6 +37,10 @@ type keyMapValue struct {
 }
 
 func NewBitcask(path string) (*Bitcask, error) {
+	return NewBitcaskWithSizeLimit(path, DefaultFileSize)
+}
+
+func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 	dir := filepath.Join(path, "bitcask")
 
 	// create bitcask dir
