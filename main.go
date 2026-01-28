@@ -169,6 +169,49 @@ func (b *Bitcask) Delete(k []byte) error {
 	return b.Put(k, v)
 }
 
+func (b *Bitcask) rotateDataFile() error {
+	// strip .dat from file name and convert to int for fileId
+	fileId, err := strconv.Atoi(strings.TrimRight(filepath.Base(b.datafile.Name()), ".dat"))
+	if err != nil {
+		return err
+	}
+
+	// increment by one
+	fileId++
+
+	// check to ensure we won't overflow
+	if fileId > 65535 {
+		return errors.New("rotateDataFile() failed: cannot exceed uint16 (65535 bytes) for unique file identifier")
+	}
+
+	// construct the new datafile name and path
+	fileName := fmt.Sprintf("%05d.dat", fileId)
+	path := filepath.Join(b.dir, fileName)
+
+	newDatafile, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		return err
+	}
+
+	// close the old file handle and point to the new datafile
+	b.datafile.Close()
+	b.datafile = newDatafile
+
+	return nil
+}
+
+func (b *Bitcask) sync() error {
+	return nil
+}
+
+func (b *Bitcask) merge() error {
+	return nil
+}
+
+func (b *Bitcask) createNewDatafile(fileName string) error {
+
+}
+
 func encodeRecord(k, v []byte, tstamp uint32) []byte {
 	keyLen := uint32(len(k))
 	valueLen := uint32(len(v))
@@ -192,20 +235,6 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 
 	return buf
 }
-
-func rotateDataFile() error {
-	// lock the current
-	return nil
-}
-
-func (b *Bitcask) sync() error {
-	return nil
-}
-
-func (b *Bitcask) merge() error {
-	return nil
-}
-
 func main() {
 	bitcask, err := NewBitcask(".")
 	if err != nil {
