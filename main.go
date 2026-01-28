@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -19,7 +20,7 @@ import (
 const DefaultFileSize = uint64(2 * 1024 * 1024 * 1024)
 
 type Bitcask struct {
-	root          string
+	dir           string
 	lock          *os.File
 	mu            sync.RWMutex
 	datafile      *os.File
@@ -47,7 +48,7 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 		return nil, err
 	}
 
-	fileId := fmt.Sprintf("%04d.dat", 1)
+	fileId := fmt.Sprintf("%05d.dat", 1)
 
 	// create datafile
 	datafilePath := filepath.Join(dir, fileId)
@@ -78,9 +79,10 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 	}
 
 	return &Bitcask{
+		dir:           dir,
 		lock:          lock,
 		mu:            sync.RWMutex{},
-		fileSizeLimit: DefaultFileSize,
+		fileSizeLimit: sizeLimit,
 		writePos:      uint64(stat.Size()),
 		datafile:      datafile,
 		keyMap:        make(map[string]*keyMapValue),
@@ -94,15 +96,15 @@ func (b *Bitcask) Put(key, value []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// rotate datafile if post write size would exceed file size limit
+	// rotate datafile if file size would exceed file size limit post write
 	if (b.writePos + uint64(len(record))) > b.fileSizeLimit {
-		err := rotateDataFile()
+		err := b.rotateDataFile()
 		if err != nil {
 			return fmt.Errorf("Put() failed: failed to rotate datafile: %v", err)
 		}
 	}
 
-	// strip .dat file extension and convert to int
+	// strip .dat from file name and convert to int for fileId
 	fileId, err := strconv.Atoi(strings.TrimRight(filepath.Base(b.datafile.Name()), ".dat"))
 	if err != nil {
 		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.datafile.Name()))
@@ -115,16 +117,14 @@ func (b *Bitcask) Put(key, value []byte) error {
 		tstamp:    tstamp,
 	}
 
-	// write to datafile
+	// setup done, write record to datafile
 	n, err := b.datafile.Write(record)
 	if err != nil {
 		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.datafile.Name()), err)
 	}
 
-	// increment write position by length of bytes written
+	// increment write position and update keyMap
 	b.writePos += uint64(n)
-
-	// update keyMap
 	b.keyMap[string(key)] = &kmv
 
 	return nil
@@ -206,10 +206,6 @@ func (b *Bitcask) sync() error {
 
 func (b *Bitcask) merge() error {
 	return nil
-}
-
-func (b *Bitcask) createNewDatafile(fileName string) error {
-
 }
 
 func encodeRecord(k, v []byte, tstamp uint32) []byte {
