@@ -19,13 +19,13 @@ import (
 const DefaultFileSize = uint64(2 * 1024 * 1024 * 1024)
 
 type Bitcask struct {
-	root      string
-	lock      *os.File
-	mu        sync.RWMutex
-	datafile  *os.File
-	sizeLimit uint64
-	writePos  uint64
-	keyMap    map[string]*keyMapValue
+	root          string
+	lock          *os.File
+	mu            sync.RWMutex
+	datafile      *os.File
+	fileSizeLimit uint64
+	writePos      uint64
+	keyMap        map[string]*keyMapValue
 }
 
 type keyMapValue struct {
@@ -78,12 +78,12 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 	}
 
 	return &Bitcask{
-		lock:      lock,
-		mu:        sync.RWMutex{},
-		sizeLimit: DefaultFileSize,
-		writePos:  uint64(stat.Size()),
-		datafile:  datafile,
-		keyMap:    make(map[string]*keyMapValue),
+		lock:          lock,
+		mu:            sync.RWMutex{},
+		fileSizeLimit: DefaultFileSize,
+		writePos:      uint64(stat.Size()),
+		datafile:      datafile,
+		keyMap:        make(map[string]*keyMapValue),
 	}, nil
 }
 
@@ -95,21 +95,21 @@ func (b *Bitcask) Put(key, value []byte) error {
 	defer b.mu.Unlock()
 
 	// rotate datafile if post write size would exceed file size limit
-	if (b.writePos + uint64(len(record))) > b.sizeLimit {
+	if (b.writePos + uint64(len(record))) > b.fileSizeLimit {
 		err := rotateDataFile()
 		if err != nil {
-			return err
+			return fmt.Errorf("Put() failed: failed to rotate datafile: %v", err)
 		}
 	}
 
 	// strip .dat file extension and convert to int
-	fileID, err := strconv.Atoi(strings.TrimRight(filepath.Base(b.datafile.Name()), ".dat"))
+	fileId, err := strconv.Atoi(strings.TrimRight(filepath.Base(b.datafile.Name()), ".dat"))
 	if err != nil {
-		return err
+		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.datafile.Name()))
 	}
 
 	kmv := keyMapValue{
-		fileId:    uint16(fileID),
+		fileId:    uint16(fileId),
 		valueSize: uint32(len(value)),
 		valuePos:  uint32(b.writePos - uint64(len(value))),
 		tstamp:    tstamp,
@@ -118,7 +118,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 	// write to datafile
 	n, err := b.datafile.Write(record)
 	if err != nil {
-		return err
+		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.datafile.Name()), err)
 	}
 
 	// increment write position by length of bytes written
