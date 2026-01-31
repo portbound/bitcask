@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -26,10 +25,10 @@ type Bitcask struct {
 	datafile      *os.File
 	fileSizeLimit uint64
 	writePos      uint64
-	keyMap        map[string]*keyMapValue
+	keyDir        map[string]*keyDirValue
 }
 
-type keyMapValue struct {
+type keyDirValue struct {
 	fileId    uint16
 	valueSize uint32
 	valuePos  uint32
@@ -48,10 +47,10 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 		return nil, err
 	}
 
-	fileId := fmt.Sprintf("%05d.dat", 1)
+	fileName := fmt.Sprintf("%05d.dat", 1)
 
 	// create datafile
-	datafilePath := filepath.Join(dir, fileId)
+	datafilePath := filepath.Join(dir, fileName)
 	datafile, err := os.OpenFile(datafilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
@@ -85,7 +84,7 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 		fileSizeLimit: sizeLimit,
 		writePos:      uint64(stat.Size()),
 		datafile:      datafile,
-		keyMap:        make(map[string]*keyMapValue),
+		keyDir:        make(map[string]*keyDirValue),
 	}, nil
 }
 
@@ -110,7 +109,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.datafile.Name()))
 	}
 
-	kmv := keyMapValue{
+	kmv := keyDirValue{
 		fileId:    uint16(fileId),
 		valueSize: uint32(len(value)),
 		valuePos:  uint32(b.writePos - uint64(len(value))),
@@ -125,7 +124,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 
 	// increment write position and update keyMap
 	b.writePos += uint64(n)
-	b.keyMap[string(key)] = &kmv
+	b.keyDir[string(key)] = &kmv
 
 	return nil
 }
@@ -134,32 +133,34 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	kmv, ok := b.keyMap[string(key)]
+	// perform key lookup
+	kdv, ok := b.keyDir[string(key)]
 	if !ok {
-		return nil, nil // not sure if this is idiomatic
+		return nil, fmt.Errorf("Get() failed: key %s not found", string(key))
 	}
 
-	// open file for reading
-	buf2 := make([]byte, 4)
-	binary.BigEndian.PutUint16(buf2, kmv.fileId)
-	file, err := os.Open(string(buf2))
+	// rebuild path to datafile and open
+	fileName := fmt.Sprintf("%05d.dat", kdv.fileId)
+	path := filepath.Join(b.dir, fileName)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = file.Seek(int64(kmv.valuePos), io.SeekStart)
+	// seek to value position
+	_, err = file.Seek(int64(kdv.valuePos), io.SeekStart)
 	if err != nil {
 		return nil, err
 	}
 
-	buf3 := make([]byte, kmv.valueSize)
-	_, err = file.Read(buf3)
+	// read value into fixed length buffer
+	buf := make([]byte, kdv.valueSize)
+	_, err = file.Read(buf)
 	if err != nil {
 		return nil, err
 	}
 
-	bytes.TrimRight(buf3, "\x00") // since the value is of fixed length, we need to trim the trailing empty bytes
-	return buf3, nil
+	return buf, nil
 }
 
 func (b *Bitcask) Delete(k []byte) error {
@@ -231,6 +232,7 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 
 	return buf
 }
+
 func main() {
 	bitcask, err := NewBitcask(".")
 	if err != nil {
