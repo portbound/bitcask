@@ -147,3 +147,37 @@ func TestBitcask_Get(t *testing.T) {
 		})
 	}
 }
+
+func TestBitcask_Delete(t *testing.T) {
+	tests := []struct {
+		name    string
+		k       []byte
+		wantErr bool
+	}{
+		{
+			name: "vanilla: passing",
+			k:    []byte("key"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, err := NewBitcask(t.TempDir())
+			if err != nil {
+				t.Fatalf("could not construct receiver type: %v", err)
+			}
+			if err := b.Put([]byte("key"), []byte("value")); err != nil {
+				t.Fatalf("failed to initialize bitcask with dummy data")
+			}
+			gotErr := b.Delete(tt.k)
+			if gotErr != nil {
+				if !tt.wantErr {
+					t.Errorf("Delete() failed: %v", gotErr)
+				}
+				return
+			}
+			if tt.wantErr {
+				t.Fatal("Delete() succeeded unexpectedly")
+			}
+		})
+	}
+}
