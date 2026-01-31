@@ -112,7 +112,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 	kmv := keyDirValue{
 		fileId:    uint16(fileId),
 		valueSize: uint32(len(value)),
-		valuePos:  uint32(b.writePos - uint64(len(value))),
+		valuePos:  uint32(b.writePos + 16 + uint64(len(key))),
 		tstamp:    tstamp,
 	}
 
