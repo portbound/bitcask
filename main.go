@@ -122,7 +122,12 @@ func (b *Bitcask) Put(key, value []byte) error {
 		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.datafile.Name()), err)
 	}
 
-	// increment write position and update keyMap
+	// forcing a sync to disk
+	if err := b.datafile.Sync(); err != nil {
+		return fmt.Errorf("Put() failed: failed to sync %v", err)
+	}
+
+	// increment write pos and update map
 	b.writePos += uint64(n)
 	b.keyDir[string(key)] = &kmv
 
@@ -146,17 +151,18 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer file.Close()
 
 	// seek to value position
-	_, err = file.Seek(int64(kdv.valuePos), io.SeekStart)
-	if err != nil {
+	if _, err = file.Seek(int64(kdv.valuePos), io.SeekStart); err != nil {
 		return nil, err
 	}
 
 	// read value into fixed length buffer
 	buf := make([]byte, kdv.valueSize)
-	_, err = file.Read(buf)
-	if err != nil {
+
+	// using io.ReadFull to ensure that an error is returned if fewer bytes are read
+	if _, err := io.ReadFull(file, buf); err != nil {
 		return nil, err
 	}
 
@@ -164,8 +170,7 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 }
 
 func (b *Bitcask) Delete(k []byte) error {
-	// using an empty value as a tombstone value
-	// during merge, any key that has a tombstone value as the most recent record is deleted
+	// using an empty slice for tombstone value
 	var v []byte
 	return b.Put(k, v)
 }
