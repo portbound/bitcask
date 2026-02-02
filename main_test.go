@@ -67,7 +67,10 @@ func TestBitcask_Put(t *testing.T) {
 			v:       []byte("value"),
 			wantErr: false,
 			setup: func(t *testing.T) *Bitcask {
-				b, err := NewBitcask(t.TempDir())
+				opts := BitcaskOpts{
+					Dir: t.TempDir(),
+				}
+				b, err := NewBitcaskWithOpts(opts)
 				if err != nil {
 					t.Fatalf("could not construct receiver type: %v", err)
 				}
@@ -80,7 +83,11 @@ func TestBitcask_Put(t *testing.T) {
 			v:       []byte("value"),
 			wantErr: false,
 			setup: func(t *testing.T) *Bitcask {
-				b, err := NewBitcaskWithSizeLimit(t.TempDir(), 1)
+				opts := BitcaskOpts{
+					Dir:         t.TempDir(),
+					MaxFileSize: 1,
+				}
+				b, err := NewBitcaskWithOpts(opts)
 				if err != nil {
 					t.Fatalf("could not construct receiver type: %v", err)
 				}
@@ -122,7 +129,10 @@ func TestBitcask_Get(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, err := NewBitcask(t.TempDir())
+			opts := BitcaskOpts{
+				Dir: t.TempDir(),
+			}
+			b, err := NewBitcaskWithOpts(opts)
 			if err != nil {
 				t.Fatalf("could not construct receiver type: %v", err)
 			}
@@ -161,7 +171,10 @@ func TestBitcask_Delete(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, err := NewBitcask(t.TempDir())
+			opts := BitcaskOpts{
+				Dir: t.TempDir(),
+			}
+			b, err := NewBitcaskWithOpts(opts)
 			if err != nil {
 				t.Fatalf("could not construct receiver type: %v", err)
 			}

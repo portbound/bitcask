@@ -16,16 +16,52 @@ import (
 	"time"
 )
 
-const DefaultFileSize = uint64(2 * 1024 * 1024 * 1024)
+const (
+	MergePolicyUnset MergePolicy = iota
+	Unrestricted
+	Never
+	Window
+)
+
+const (
+	SyncStrategyUnset SyncStrategy = iota
+	None
+	Always
+	Interval
+)
+
+type MergePolicy int
+
+type SyncStrategy int
 
 type Bitcask struct {
-	dir           string
-	lock          *os.File
-	mu            sync.RWMutex
-	datafile      *os.File
-	fileSizeLimit uint64
-	writePos      uint64
-	keyDir        map[string]*keyDirValue
+	lock     *os.File
+	mu       sync.RWMutex
+	datafile *os.File
+	writePos uint64
+	keyDir   map[string]*keyDirValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
+	opts     BitcaskOpts
+}
+
+type BitcaskOpts struct {
+	Dir             string
+	MaxFileSize     uint64
+	MergePolicy     MergePolicy
+	MergeTriggers   MergeTriggers
+	MergeThresholds MergeThresholds
+	MergeInterval   time.Duration
+	SyncStrategy    SyncStrategy
+}
+
+type MergeTriggers struct {
+	Fragmentation int
+	DeadBytes     uint64
+}
+
+type MergeThresholds struct {
+	Fragmentation int
+	DeadBytes     uint64
+	SmallFile     uint64
 }
 
 type keyDirValue struct {
@@ -35,12 +71,61 @@ type keyDirValue struct {
 	tstamp    uint32
 }
 
-func NewBitcask(path string) (*Bitcask, error) {
-	return NewBitcaskWithSizeLimit(path, DefaultFileSize)
+func NewBitcask() (*Bitcask, error) {
+	return NewBitcaskWithOpts(defaultOpts)
 }
 
-func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
-	dir := filepath.Join(path, "bitcask")
+var defaultOpts = BitcaskOpts{
+	Dir:         ".",
+	MaxFileSize: uint64(2 * 1024 * 1024 * 1024),
+	MergePolicy: Unrestricted,
+	MergeTriggers: MergeTriggers{
+		Fragmentation: 60,
+		DeadBytes:     uint64(512 * 1024 * 1024),
+	},
+	MergeThresholds: MergeThresholds{
+		Fragmentation: 40,
+		DeadBytes:     uint64(128 * 1024 * 1024),
+		SmallFile:     uint64(10 * 1024 * 1024),
+	},
+	MergeInterval: 3 * time.Minute,
+	SyncStrategy:  None,
+}
+
+func NewBitcaskWithOpts(opts BitcaskOpts) (*Bitcask, error) {
+	// build out options
+	if opts.Dir == "" {
+		opts.Dir = defaultOpts.Dir
+	}
+	if opts.MaxFileSize == 0 {
+		opts.MaxFileSize = defaultOpts.MaxFileSize
+	}
+	if opts.MergePolicy == MergePolicyUnset {
+		opts.MergePolicy = defaultOpts.MergePolicy
+	}
+	if opts.MergeTriggers.Fragmentation == 0 {
+		opts.MergeTriggers.Fragmentation = defaultOpts.MergeTriggers.Fragmentation
+	}
+	if opts.MergeTriggers.DeadBytes == 0 {
+		opts.MergeTriggers.DeadBytes = defaultOpts.MergeTriggers.DeadBytes
+	}
+	if opts.MergeThresholds.Fragmentation == 0 {
+		opts.MergeThresholds.Fragmentation = defaultOpts.MergeThresholds.Fragmentation
+	}
+	if opts.MergeThresholds.DeadBytes == 0 {
+		opts.MergeThresholds.DeadBytes = defaultOpts.MergeThresholds.DeadBytes
+	}
+	if opts.MergeThresholds.SmallFile == 0 {
+		opts.MergeThresholds.SmallFile = defaultOpts.MergeThresholds.SmallFile
+	}
+	if opts.MergeInterval == 0 {
+		opts.MergeInterval = defaultOpts.MergeInterval
+	}
+	if opts.SyncStrategy == SyncStrategyUnset {
+		opts.SyncStrategy = defaultOpts.SyncStrategy
+	}
+
+	dir := filepath.Join(opts.Dir, "bitcask")
 
 	// create bitcask dir
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -57,7 +142,6 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 	}
 
 	// get new file FileInfo
-
 	stat, err := datafile.Stat()
 	if err != nil {
 		return nil, err
@@ -78,13 +162,12 @@ func NewBitcaskWithSizeLimit(path string, sizeLimit uint64) (*Bitcask, error) {
 	}
 
 	return &Bitcask{
-		dir:           dir,
-		lock:          lock,
-		mu:            sync.RWMutex{},
-		fileSizeLimit: sizeLimit,
-		writePos:      uint64(stat.Size()),
-		datafile:      datafile,
-		keyDir:        make(map[string]*keyDirValue),
+		lock:     lock,
+		mu:       sync.RWMutex{},
+		writePos: uint64(stat.Size()),
+		datafile: datafile,
+		keyDir:   make(map[string]*keyDirValue),
+		opts:     opts,
 	}, nil
 }
 
@@ -96,7 +179,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 	defer b.mu.Unlock()
 
 	// rotate datafile if file size would exceed file size limit post write
-	if (b.writePos + uint64(len(record))) > b.fileSizeLimit {
+	if (b.writePos + uint64(len(record))) > b.opts.MaxFileSize {
 		err := b.rotateDataFile()
 		if err != nil {
 			return fmt.Errorf("Put() failed: failed to rotate datafile: %v", err)
@@ -122,9 +205,11 @@ func (b *Bitcask) Put(key, value []byte) error {
 		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.datafile.Name()), err)
 	}
 
-	// forcing a sync to disk
-	if err := b.datafile.Sync(); err != nil {
-		return fmt.Errorf("Put() failed: failed to sync %v", err)
+	// TODO not sure how to handle the 'interval' option in the spec without some sort of background worker listening for calls to sync... Think about it some more
+	if b.opts.SyncStrategy == SyncStrategy(Always) {
+		if err := b.datafile.Sync(); err != nil {
+			return fmt.Errorf("Put() failed: failed to sync %v", err)
+		}
 	}
 
 	// increment write pos and update map
@@ -146,7 +231,7 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 
 	// rebuild path to datafile and open
 	fileName := fmt.Sprintf("%05d.dat", kdv.fileId)
-	path := filepath.Join(b.dir, fileName)
+	path := filepath.Join(b.opts.Dir, fileName)
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -192,7 +277,7 @@ func (b *Bitcask) rotateDataFile() error {
 
 	// construct the new datafile name and path
 	fileName := fmt.Sprintf("%05d.dat", fileId)
-	path := filepath.Join(b.dir, fileName)
+	path := filepath.Join(b.opts.Dir, fileName)
 
 	newDatafile, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
@@ -203,10 +288,6 @@ func (b *Bitcask) rotateDataFile() error {
 	b.datafile.Close()
 	b.datafile = newDatafile
 
-	return nil
-}
-
-func (b *Bitcask) sync() error {
 	return nil
 }
 
@@ -239,7 +320,7 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 }
 
 func main() {
-	bitcask, err := NewBitcask(".")
+	bitcask, err := NewBitcask()
 	if err != nil {
 		log.Fatalf("failed to create bitcask: %v", err)
 	}
