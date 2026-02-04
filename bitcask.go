@@ -30,8 +30,14 @@ const (
 	SyncStrategyUnset SyncStrategy = iota
 	None
 	Always
-	Interval // TODO not sure we want to implement this
+	Interval // TODO not sure how to handle the 'interval' option in the spec without some sort of background worker listening for calls to sync... Think about it some more - may be worth moving to simpler implementation like the code below
 )
+
+// const (
+// 	SyncStrategyUnset SyncStrategy = iota
+// 	Disabled
+// 	Enabled
+// )
 
 type MergeTriggers struct {
 	Fragmentation int
@@ -61,13 +67,15 @@ type Bitcask struct {
 }
 
 type bitcaskOpts struct {
-	Dir             string
-	MaxFileSize     uint64
-	MergePolicy     MergePolicy
-	MergeTriggers   MergeTriggers
-	MergeThresholds MergeThresholds
-	MergeInterval   time.Duration
-	SyncStrategy    SyncStrategy
+	Dir              string
+	MaxFileSize      uint64
+	MergePolicy      MergePolicy
+	MergeTriggers    MergeTriggers
+	MergeThresholds  MergeThresholds
+	MergeInterval    time.Duration
+	MergeWindowStart int
+	MergeWindowEnd   int
+	SyncStrategy     SyncStrategy
 }
 
 var defaultOpts = bitcaskOpts{
@@ -83,8 +91,10 @@ var defaultOpts = bitcaskOpts{
 		DeadBytes:     uint64(128 * 1024 * 1024),
 		SmallFile:     uint64(10 * 1024 * 1024),
 	},
-	MergeInterval: 3 * time.Minute,
-	SyncStrategy:  Always,
+	MergeInterval:    3 * time.Minute,
+	MergeWindowStart: 0,
+	MergeWindowEnd:   0,
+	SyncStrategy:     Always,
 }
 
 func WithDir(dir string) func(*Bitcask) {
@@ -123,12 +133,20 @@ func WithMergeInterval(interval time.Duration) func(*Bitcask) {
 	}
 }
 
+func WithMergeWindow(start, end int) func(*Bitcask) {
+	return func(b *Bitcask) {
+		b.opts.MergeWindowStart = start
+		b.opts.MergeWindowEnd = end
+	}
+}
+
 func WithSyncStrategy(strategy SyncStrategy) func(*Bitcask) {
 	return func(b *Bitcask) {
 		b.opts.SyncStrategy = strategy
 	}
 }
 
+// TODO revisit the structure of New to make sure the order of logic makes sense
 func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 	b := Bitcask{
 		mu:     sync.RWMutex{},
@@ -179,6 +197,12 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 		return nil, err
 	}
 
+	go b.handleMergeInterval()
+
+	// if b.opts.MergePolicy == Window {
+	// 	go b.handleMergeWindow(b.opts.MergeWindowStart, b.opts.MergeWindowEnd)
+	// }
+
 	return &b, nil
 }
 
@@ -216,7 +240,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.datafile.Name()), err)
 	}
 
-	// TODO not sure how to handle the 'interval' option in the spec without some sort of background worker listening for calls to sync... Think about it some more
+	// sync?
 	if b.opts.SyncStrategy == SyncStrategy(Always) {
 		if err := b.datafile.Sync(); err != nil {
 			return fmt.Errorf("Put() failed: failed to sync %v", err)
@@ -226,6 +250,10 @@ func (b *Bitcask) Put(key, value []byte) error {
 	// increment write pos and update map
 	b.writePos += uint64(n)
 	b.keyDir[string(key)] = &kmv
+
+	// if b.opts.MergePolicy != Window {
+	// 	tryMerge()
+	// }
 
 	return nil
 }
@@ -331,4 +359,19 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 
 func (b *Bitcask) merge() error {
 	return nil
+}
+
+func (b *Bitcask) handleMergeWindow(start, end int) error {
+	// wait until interval
+	// call mergeCheck
+	return nil
+}
+
+func (b Bitcask) handleMergeInterval() {
+	// need to loop? here until the interval has stopped.
+	// probably need a ticker
+	// when timer is up, check to see if we have a policy window
+	// if we do, check to see if the current time falls within that window
+	// if it does, proceed
+	// if it doesn't, continue and wait until ticker goes off again before checking the window
 }
