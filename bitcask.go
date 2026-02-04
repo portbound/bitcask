@@ -1,4 +1,4 @@
-package main
+package bitcask
 
 import (
 	"encoding/binary"
@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +15,8 @@ import (
 	"time"
 )
 
+type MergePolicy int
+
 const (
 	MergePolicyUnset MergePolicy = iota
 	Unrestricted
@@ -23,35 +24,14 @@ const (
 	Window
 )
 
+type SyncStrategy int
+
 const (
 	SyncStrategyUnset SyncStrategy = iota
 	None
 	Always
-	Interval
+	Interval // TODO not sure we want to implement this
 )
-
-type MergePolicy int
-
-type SyncStrategy int
-
-type Bitcask struct {
-	lock     *os.File
-	mu       sync.RWMutex
-	datafile *os.File
-	writePos uint64
-	keyDir   map[string]*keyDirValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
-	opts     BitcaskOpts
-}
-
-type BitcaskOpts struct {
-	Dir             string
-	MaxFileSize     uint64
-	MergePolicy     MergePolicy
-	MergeTriggers   MergeTriggers
-	MergeThresholds MergeThresholds
-	MergeInterval   time.Duration
-	SyncStrategy    SyncStrategy
-}
 
 type MergeTriggers struct {
 	Fragmentation int
@@ -64,18 +44,33 @@ type MergeThresholds struct {
 	SmallFile     uint64
 }
 
-type keyDirValue struct {
-	fileId    uint16
-	valueSize uint32
-	valuePos  uint32
-	tstamp    uint32
+type KeyDirValue struct {
+	FileID    uint16
+	ValueSize uint32
+	ValuePos  uint32
+	Tstamp    uint32
 }
 
-func NewBitcask() (*Bitcask, error) {
-	return NewBitcaskWithOpts(defaultOpts)
+type Bitcask struct {
+	lock     *os.File
+	mu       sync.RWMutex
+	datafile *os.File
+	writePos uint64
+	keyDir   map[string]*KeyDirValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
+	opts     bitcaskOpts
 }
 
-var defaultOpts = BitcaskOpts{
+type bitcaskOpts struct {
+	Dir             string
+	MaxFileSize     uint64
+	MergePolicy     MergePolicy
+	MergeTriggers   MergeTriggers
+	MergeThresholds MergeThresholds
+	MergeInterval   time.Duration
+	SyncStrategy    SyncStrategy
+}
+
+var defaultOpts = bitcaskOpts{
 	Dir:         ".",
 	MaxFileSize: uint64(2 * 1024 * 1024 * 1024),
 	MergePolicy: Unrestricted,
@@ -89,63 +84,85 @@ var defaultOpts = BitcaskOpts{
 		SmallFile:     uint64(10 * 1024 * 1024),
 	},
 	MergeInterval: 3 * time.Minute,
-	SyncStrategy:  None,
+	SyncStrategy:  Always,
 }
 
-func NewBitcaskWithOpts(opts BitcaskOpts) (*Bitcask, error) {
-	// build out options
-	if opts.Dir == "" {
-		opts.Dir = defaultOpts.Dir
+func WithDir(dir string) func(*Bitcask) {
+	return func(b *Bitcask) {
+		b.opts.Dir = dir
 	}
-	if opts.MaxFileSize == 0 {
-		opts.MaxFileSize = defaultOpts.MaxFileSize
+}
+
+func WithMaxFileSize(size uint64) func(*Bitcask) {
+	return func(b *Bitcask) {
+		b.opts.MaxFileSize = size
 	}
-	if opts.MergePolicy == MergePolicyUnset {
-		opts.MergePolicy = defaultOpts.MergePolicy
+}
+
+func WithMergePolicy(policy MergePolicy) func(*Bitcask) {
+	return func(b *Bitcask) {
+		b.opts.MergePolicy = policy
 	}
-	if opts.MergeTriggers.Fragmentation == 0 {
-		opts.MergeTriggers.Fragmentation = defaultOpts.MergeTriggers.Fragmentation
+}
+
+func WithMergeTriggers(triggers MergeTriggers) func(*Bitcask) {
+	return func(b *Bitcask) {
+		b.opts.MergeTriggers = triggers
 	}
-	if opts.MergeTriggers.DeadBytes == 0 {
-		opts.MergeTriggers.DeadBytes = defaultOpts.MergeTriggers.DeadBytes
+}
+
+func WithMergeThreshold(thresholds MergeThresholds) func(*Bitcask) {
+	return func(b *Bitcask) {
+		b.opts.MergeThresholds = thresholds
 	}
-	if opts.MergeThresholds.Fragmentation == 0 {
-		opts.MergeThresholds.Fragmentation = defaultOpts.MergeThresholds.Fragmentation
+}
+
+func WithMergeInterval(interval time.Duration) func(*Bitcask) {
+	return func(b *Bitcask) {
+		b.opts.MergeInterval = interval
 	}
-	if opts.MergeThresholds.DeadBytes == 0 {
-		opts.MergeThresholds.DeadBytes = defaultOpts.MergeThresholds.DeadBytes
+}
+
+func WithSyncStrategy(strategy SyncStrategy) func(*Bitcask) {
+	return func(b *Bitcask) {
+		b.opts.SyncStrategy = strategy
 	}
-	if opts.MergeThresholds.SmallFile == 0 {
-		opts.MergeThresholds.SmallFile = defaultOpts.MergeThresholds.SmallFile
-	}
-	if opts.MergeInterval == 0 {
-		opts.MergeInterval = defaultOpts.MergeInterval
-	}
-	if opts.SyncStrategy == SyncStrategyUnset {
-		opts.SyncStrategy = defaultOpts.SyncStrategy
+}
+
+func New(opts ...func(*Bitcask)) (*Bitcask, error) {
+	b := Bitcask{
+		mu:     sync.RWMutex{},
+		keyDir: make(map[string]*KeyDirValue),
+		opts:   defaultOpts,
 	}
 
-	dir := filepath.Join(opts.Dir, "bitcask")
+	// override defaultOpts with user preferences
+	for _, opt := range opts {
+		opt(&b)
+	}
 
 	// create bitcask dir
+	dir := filepath.Join(b.opts.Dir, "bitcask")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-
-	fileName := fmt.Sprintf("%05d.dat", 1)
+	b.opts.Dir = dir
 
 	// create datafile
+	fileName := fmt.Sprintf("%05d.dat", 1)
 	datafilePath := filepath.Join(dir, fileName)
 	datafile, err := os.OpenFile(datafilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
+	b.datafile = datafile
 
 	// get new file FileInfo
 	stat, err := datafile.Stat()
 	if err != nil {
 		return nil, err
 	}
+	b.writePos = uint64(stat.Size())
 
 	// create bitcask file lock
 	lockPath := filepath.Join(dir, ".lock")
@@ -153,6 +170,7 @@ func NewBitcaskWithOpts(opts BitcaskOpts) (*Bitcask, error) {
 	if err != nil {
 		return nil, err
 	}
+	b.lock = lock
 
 	// aquire bitcask file lock
 	err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
@@ -161,25 +179,18 @@ func NewBitcaskWithOpts(opts BitcaskOpts) (*Bitcask, error) {
 		return nil, err
 	}
 
-	return &Bitcask{
-		lock:     lock,
-		mu:       sync.RWMutex{},
-		writePos: uint64(stat.Size()),
-		datafile: datafile,
-		keyDir:   make(map[string]*keyDirValue),
-		opts:     opts,
-	}, nil
+	return &b, nil
 }
 
 func (b *Bitcask) Put(key, value []byte) error {
 	tstamp := uint32(time.Now().Unix())
-	record := encodeRecord(key, value, tstamp)
+	encodedRecord := encodeRecord(key, value, tstamp)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	// rotate datafile if file size would exceed file size limit post write
-	if (b.writePos + uint64(len(record))) > b.opts.MaxFileSize {
+	if (b.writePos + uint64(len(encodedRecord))) > b.opts.MaxFileSize {
 		err := b.rotateDataFile()
 		if err != nil {
 			return fmt.Errorf("Put() failed: failed to rotate datafile: %v", err)
@@ -192,15 +203,15 @@ func (b *Bitcask) Put(key, value []byte) error {
 		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.datafile.Name()))
 	}
 
-	kmv := keyDirValue{
-		fileId:    uint16(fileId),
-		valueSize: uint32(len(value)),
-		valuePos:  uint32(b.writePos + 16 + uint64(len(key))),
-		tstamp:    tstamp,
+	kmv := KeyDirValue{
+		FileID:    uint16(fileId),
+		ValueSize: uint32(len(value)),
+		ValuePos:  uint32(b.writePos + 16 + uint64(len(key))),
+		Tstamp:    tstamp,
 	}
 
 	// setup done, write record to datafile
-	n, err := b.datafile.Write(record)
+	n, err := b.datafile.Write(encodedRecord)
 	if err != nil {
 		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.datafile.Name()), err)
 	}
@@ -230,7 +241,7 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	}
 
 	// rebuild path to datafile and open
-	fileName := fmt.Sprintf("%05d.dat", kdv.fileId)
+	fileName := fmt.Sprintf("%05d.dat", kdv.FileID)
 	path := filepath.Join(b.opts.Dir, fileName)
 	file, err := os.Open(path)
 	if err != nil {
@@ -239,12 +250,12 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	defer file.Close()
 
 	// seek to value position
-	if _, err = file.Seek(int64(kdv.valuePos), io.SeekStart); err != nil {
+	if _, err = file.Seek(int64(kdv.ValuePos), io.SeekStart); err != nil {
 		return nil, err
 	}
 
 	// read value into fixed length buffer
-	buf := make([]byte, kdv.valueSize)
+	buf := make([]byte, kdv.ValueSize)
 
 	// using io.ReadFull to ensure that an error is returned if fewer bytes are read
 	if _, err := io.ReadFull(file, buf); err != nil {
@@ -291,17 +302,15 @@ func (b *Bitcask) rotateDataFile() error {
 	return nil
 }
 
-func (b *Bitcask) merge() error {
-	return nil
-}
-
+// Encode takes a key, value, and timestamp and returns a byte slice representing the record in the on-disk format.
 func encodeRecord(k, v []byte, tstamp uint32) []byte {
 	keyLen := uint32(len(k))
 	valueLen := uint32(len(v))
 
+	// create a buffer with enough space for the entire record
 	buf := make([]byte, 16+len(k)+len(v))
 
-	// pad start by 4 bytes to save room for the checksum
+	// leave the first 4 bytes empty to save room for the checksum
 	offset := 4
 	binary.BigEndian.PutUint32(buf[offset:], tstamp)
 	offset += 4
@@ -313,16 +322,13 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 	offset += len(k)
 	copy(buf[offset:], v)
 
+	// calculate checksum over the entire record (minus the checksum itself)
 	checksum := crc32.ChecksumIEEE(buf[4:])
 	binary.BigEndian.PutUint32(buf[0:4], checksum)
 
 	return buf
 }
 
-func main() {
-	bitcask, err := NewBitcask()
-	if err != nil {
-		log.Fatalf("failed to create bitcask: %v", err)
-	}
-	defer bitcask.lock.Close()
+func (b *Bitcask) merge() error {
+	return nil
 }
