@@ -62,7 +62,7 @@ type Bitcask struct {
 	mu       sync.RWMutex
 	datafile *os.File
 	writePos uint64
-	keyDir   map[string]*KeyDirValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
+	keyMap   map[string]*KeyDirValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
 	opts     bitcaskOpts
 }
 
@@ -150,7 +150,7 @@ func WithSyncStrategy(strategy SyncStrategy) func(*Bitcask) {
 func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 	b := Bitcask{
 		mu:     sync.RWMutex{},
-		keyDir: make(map[string]*KeyDirValue),
+		keyMap: make(map[string]*KeyDirValue),
 		opts:   defaultOpts,
 	}
 
@@ -197,7 +197,9 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 		return nil, err
 	}
 
-	go b.handleMergeInterval()
+	if b.opts.MergePolicy != Never {
+		go b.mergeWorker()
+	}
 
 	// if b.opts.MergePolicy == Window {
 	// 	go b.handleMergeWindow(b.opts.MergeWindowStart, b.opts.MergeWindowEnd)
@@ -249,7 +251,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 
 	// increment write pos and update map
 	b.writePos += uint64(n)
-	b.keyDir[string(key)] = &kmv
+	b.keyMap[string(key)] = &kmv
 
 	// if b.opts.MergePolicy != Window {
 	// 	tryMerge()
@@ -263,7 +265,7 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	defer b.mu.RUnlock()
 
 	// perform key lookup
-	kdv, ok := b.keyDir[string(key)]
+	kdv, ok := b.keyMap[string(key)]
 	if !ok {
 		return nil, fmt.Errorf("Get() failed: key %s not found", string(key))
 	}
@@ -330,6 +332,14 @@ func (b *Bitcask) rotateDataFile() error {
 	return nil
 }
 
+func (b *Bitcask) mergeWorker() {
+	// this should walk the filetree sequentially checking to see if the merge thresholds have been exceeded
+	// in the event that they do, call a merge
+
+	// if the user has specified that they do NOT want to merge at all, this worker should not be spawned
+	// if the user has specified that they only want to merge in a specified window, the worker should sleep until that window starts
+}
+
 // Encode takes a key, value, and timestamp and returns a byte slice representing the record in the on-disk format.
 func encodeRecord(k, v []byte, tstamp uint32) []byte {
 	keyLen := uint32(len(k))
@@ -357,21 +367,24 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 	return buf
 }
 
-func (b *Bitcask) merge() error {
-	return nil
-}
+func merge() error {
+	// triggered by framentation and dead bytes
+	// both of which require knowledge of dead keys
 
-func (b *Bitcask) handleMergeWindow(start, end int) error {
-	// wait until interval
-	// call mergeCheck
-	return nil
-}
+	// shelving this, apparently the random reads are slower based on how file IO actually works. Also the OS' readahead cache should make sequential reads significantly quicker
+	// going to keep it though because I want to test it to benchmark and see how much savings I can actually get
+	// For Science!!
 
-func (b Bitcask) handleMergeInterval() {
-	// need to loop? here until the interval has stopped.
-	// probably need a ticker
-	// when timer is up, check to see if we have a policy window
-	// if we do, check to see if the current time falls within that window
-	// if it does, proceed
-	// if it doesn't, continue and wait until ticker goes off again before checking the window
+	// create mergefile
+	// create hintfile (shape of keyMap)
+	// for each key in keyMap
+	// if the file_id is not the active datafile
+	// open the file and seek to the end of the value
+	// copy the preceding 16 + len(k) + value_size
+	// attempt to append those bytes to the end of the mergefile (check size first)
+	// add entry to hintfile
+	// update keyMap key entry to reference hint file?
+	// when finished iterating through keyMap, delete all old datafiles
+
+	return nil
 }
