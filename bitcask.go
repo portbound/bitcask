@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -326,6 +327,8 @@ func (b *Bitcask) rotateDataFile() error {
 	}
 
 	// close the old file handle and point to the new datafile
+
+	os.Chmod(b.datafile.Name(), 0444)
 	b.datafile.Close()
 	b.datafile = newDatafile
 
@@ -334,6 +337,70 @@ func (b *Bitcask) rotateDataFile() error {
 
 func (b *Bitcask) mergeWorker() {
 	// this should walk the filetree sequentially checking to see if the merge thresholds have been exceeded
+	//
+
+	// maybe we make a merge method that get's called
+	entries, err := os.ReadDir(b.opts.Dir)
+	if err != nil {
+		// do something
+	}
+
+	// we should try to aquire a read only lock here so we don't stop reads from working
+	// then, when we've assembled the mergefile and hint file, we can aquire the full lock to go ahead and delete the old data files
+	mergeFile, err := os.OpenFile(b.datafile.Name(), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0444)
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() == b.datafile.Name() {
+			continue
+		}
+
+		// if its a normal data file
+		file, err := os.Open(path.Join(b.opts.Dir, entry.Name()))
+		if err != nil {
+			// do something
+		}
+
+		// read first 16 bytes
+		// this seems kind of inefficient? maybe it's fine... just seems like a lot of allocations. Maybe it's better to create a fixsized buffer and append to it and then resize if needed
+
+		buf := make([]byte, 8)
+		_, err = io.ReadFull(file, buf)
+		if err != nil {
+			// do something
+		}
+
+		keysize := make([]byte, 4)
+		_, err = io.ReadFull(file, keysize)
+		if err != nil {
+			// do something
+		}
+
+		valueSize := make([]byte, 4)
+		_, err = io.ReadFull(file, valueSize)
+		if err != nil {
+			// do something
+		}
+
+		key := make([]byte, len(keysize))
+		_, err = io.ReadFull(file, key)
+		if err != nil {
+			// do something
+		}
+
+		value := make([]byte, len(valueSize))
+		_, err = io.ReadFull(file, value)
+		if err != nil {
+			// do something
+		}
+
+		if val, ok := b.keyMap[string(key)]; ok {
+			// copy to the new merge file
+			// add an entry to the hint file
+		}
+	}
+
+	// after we've finished iterating over every file
+	// aquire
+
 	// in the event that they do, call a merge
 
 	// if the user has specified that they do NOT want to merge at all, this worker should not be spawned
