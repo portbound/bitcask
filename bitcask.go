@@ -7,7 +7,6 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -51,8 +50,8 @@ type MergeThresholds struct {
 	SmallFile     uint64
 }
 
-type KeyDirValue struct {
-	FileID    uint16
+type KeyMapValue struct {
+	FileId    uint16
 	ValueSize uint32
 	ValuePos  uint32
 	Tstamp    uint32
@@ -63,7 +62,7 @@ type Bitcask struct {
 	mu       sync.RWMutex
 	datafile *os.File
 	writePos uint64
-	keyMap   map[string]*KeyDirValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
+	keyMap   map[string]*KeyMapValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
 	opts     bitcaskOpts
 }
 
@@ -151,7 +150,7 @@ func WithSyncStrategy(strategy SyncStrategy) func(*Bitcask) {
 func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 	b := Bitcask{
 		mu:     sync.RWMutex{},
-		keyMap: make(map[string]*KeyDirValue),
+		keyMap: make(map[string]*KeyMapValue),
 		opts:   defaultOpts,
 	}
 
@@ -168,7 +167,7 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 	b.opts.Dir = dir
 
 	// create datafile
-	fileName := fmt.Sprintf("%05d.dat", 1)
+	fileName := fmt.Sprintf("%04d.dat", 1)
 	datafilePath := filepath.Join(dir, fileName)
 	datafile, err := os.OpenFile(datafilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
@@ -198,9 +197,9 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 		return nil, err
 	}
 
-	if b.opts.MergePolicy != Never {
-		go b.mergeWorker()
-	}
+	// if b.opts.MergePolicy != Never {
+	// 	go b.mergeWorker()
+	// }
 
 	// if b.opts.MergePolicy == Window {
 	// 	go b.handleMergeWindow(b.opts.MergeWindowStart, b.opts.MergeWindowEnd)
@@ -225,13 +224,15 @@ func (b *Bitcask) Put(key, value []byte) error {
 	}
 
 	// strip .dat from file name and convert to int for fileId
-	fileId, err := strconv.Atoi(strings.TrimRight(filepath.Base(b.datafile.Name()), ".dat"))
+	baseFileName := filepath.Base(b.datafile.Name())
+	// TODO need to revisit this
+	fileId, err := strconv.Atoi(strings.TrimRight(baseFileName, ".dat"))
 	if err != nil {
 		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.datafile.Name()))
 	}
 
-	kmv := KeyDirValue{
-		FileID:    uint16(fileId),
+	kmv := KeyMapValue{
+		FileId:    uint16(fileId),
 		ValueSize: uint32(len(value)),
 		ValuePos:  uint32(b.writePos + 16 + uint64(len(key))),
 		Tstamp:    tstamp,
@@ -266,13 +267,13 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	defer b.mu.RUnlock()
 
 	// perform key lookup
-	kdv, ok := b.keyMap[string(key)]
+	kmv, ok := b.keyMap[string(key)]
 	if !ok {
 		return nil, fmt.Errorf("Get() failed: key %s not found", string(key))
 	}
 
 	// rebuild path to datafile and open
-	fileName := fmt.Sprintf("%05d.dat", kdv.FileID)
+	fileName := fmt.Sprintf("%04d.dat", kmv.FileId)
 	path := filepath.Join(b.opts.Dir, fileName)
 	file, err := os.Open(path)
 	if err != nil {
@@ -281,12 +282,12 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	defer file.Close()
 
 	// seek to value position
-	if _, err = file.Seek(int64(kdv.ValuePos), io.SeekStart); err != nil {
+	if _, err = file.Seek(int64(kmv.ValuePos), io.SeekStart); err != nil {
 		return nil, err
 	}
 
 	// read value into fixed length buffer
-	buf := make([]byte, kdv.ValueSize)
+	buf := make([]byte, kmv.ValueSize)
 
 	// using io.ReadFull to ensure that an error is returned if fewer bytes are read
 	if _, err := io.ReadFull(file, buf); err != nil {
@@ -332,80 +333,115 @@ func (b *Bitcask) rotateDataFile() error {
 	b.datafile.Close()
 	b.datafile = newDatafile
 
+	// TODO, check this, but we need to move the write pos to 0 since this is a new file
+	stat, err := b.datafile.Stat()
+	if err != nil {
+		return err
+	}
+	b.writePos = uint64(stat.Size())
+
 	return nil
 }
 
-func (b *Bitcask) mergeWorker() {
-	// this should walk the filetree sequentially checking to see if the merge thresholds have been exceeded
-	//
-
-	// maybe we make a merge method that get's called
-	entries, err := os.ReadDir(b.opts.Dir)
-	if err != nil {
-		// do something
-	}
-
-	// we should try to aquire a read only lock here so we don't stop reads from working
-	// then, when we've assembled the mergefile and hint file, we can aquire the full lock to go ahead and delete the old data files
-	mergeFile, err := os.OpenFile(b.datafile.Name(), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0444)
-	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() == b.datafile.Name() {
-			continue
-		}
-
-		// if its a normal data file
-		file, err := os.Open(path.Join(b.opts.Dir, entry.Name()))
-		if err != nil {
-			// do something
-		}
-
-		// read first 16 bytes
-		// this seems kind of inefficient? maybe it's fine... just seems like a lot of allocations. Maybe it's better to create a fixsized buffer and append to it and then resize if needed
-
-		buf := make([]byte, 8)
-		_, err = io.ReadFull(file, buf)
-		if err != nil {
-			// do something
-		}
-
-		keysize := make([]byte, 4)
-		_, err = io.ReadFull(file, keysize)
-		if err != nil {
-			// do something
-		}
-
-		valueSize := make([]byte, 4)
-		_, err = io.ReadFull(file, valueSize)
-		if err != nil {
-			// do something
-		}
-
-		key := make([]byte, len(keysize))
-		_, err = io.ReadFull(file, key)
-		if err != nil {
-			// do something
-		}
-
-		value := make([]byte, len(valueSize))
-		_, err = io.ReadFull(file, value)
-		if err != nil {
-			// do something
-		}
-
-		if val, ok := b.keyMap[string(key)]; ok {
-			// copy to the new merge file
-			// add an entry to the hint file
-		}
-	}
-
-	// after we've finished iterating over every file
-	// aquire
-
-	// in the event that they do, call a merge
-
-	// if the user has specified that they do NOT want to merge at all, this worker should not be spawned
-	// if the user has specified that they only want to merge in a specified window, the worker should sleep until that window starts
-}
+// func (b *Bitcask) mergeWorker() {
+// 	// this should walk the filetree sequentially checking to see if the merge thresholds have been exceeded
+// 	//
+//
+// 	// maybe we make a merge method that get's called
+// 	entries, err := os.ReadDir(b.opts.Dir)
+// 	if err != nil {
+// 		// do something
+// 	}
+//
+// 	// we should try to aquire a read only lock here so we don't stop reads from working
+// 	// then, when we've assembled the mergefile and hint file, we can aquire the full lock to go ahead and delete the old data files
+// 	mergeFileName := fmt.Sprintf("m_%04d.dat", len(entries)+1)
+// 	mergeFile, err := os.OpenFile(mergeFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0444)
+//
+// 	hintFileName := fmt.Sprintf("m_%04d.hint", len(entries)+1)
+// 	hintFile, err := os.OpenFile(hintFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0444)
+// 	for _, entry := range entries {
+// 		if entry.IsDir() || entry.Name() == b.datafile.Name() {
+// 			continue
+// 		}
+//
+// 		// if its a normal data file
+// 		file, err := os.Open(filepath.Join(b.opts.Dir, entry.Name()))
+// 		if err != nil {
+// 			// do something
+// 		}
+//
+// 		// read first 16 bytes
+// 		buf := make([]byte, 16)
+// 		_, err = io.ReadFull(file, buf)
+// 		if err != nil {
+// 			// do something
+// 		}
+//
+// 		// rebuild key
+// 		keySize := binary.BigEndian.Uint32(buf[8:12])
+// 		key := make([]byte, keySize)
+// 		_, err = io.ReadFull(file, key)
+// 		if err != nil {
+// 			// do something
+// 		}
+//
+// 		// check keyMap for key and continue if not present
+// 		val, ok := b.keyMap[string(key)]
+// 		if !ok {
+// 			continue
+// 		}
+//
+// 		// TODO need to revisit this logic here (and also inside Put())
+// 		baseFileName := filepath.Base(b.datafile.Name())
+// 		fileId, err := strconv.Atoi(strings.TrimRight(baseFileName, ".dat"))
+// 		if err != nil {
+// 			// do something
+// 		}
+//
+// 		// if this entry is not the active entry in the keyMap skip it
+// 		if val.FileId != uint16(fileId) {
+// 			continue
+// 		}
+//
+// 		valueSize := binary.BigEndian.Uint32(buf[12:16])
+// 		value := make([]byte, valueSize)
+// 		_, err = io.ReadFull(file, value)
+// 		if err != nil {
+// 			// do something
+// 		}
+//
+// 		record := make([]byte, 16+keySize+valueSize)
+// 		copy(record, buf)
+// 		offset := 16
+// 		copy(record[offset:], key)
+// 		offset += int(keySize)
+// 		copy(record[offset:], value)
+//
+// 		_, err = mergeFile.Write(record)
+// 		if err != nil {
+// 			// do something
+// 		}
+//
+// 		// tstamp, ksz, vsz, v_pos, key
+// 		var hOffset int
+// 		hint := make([]byte, 16+keySize)
+// 		binary.BigEndian.AppendUint32(hint, val.Tstamp)
+// 		binary.BigEndian.AppendUint32(hint, keySize)
+// 		binary.BigEndian.AppendUint32(hint, valueSize)
+//
+// 		_, err = hintFile.Write()
+//
+// 	}
+//
+// 	// after we've finished iterating over every file
+// 	// aquire
+//
+// 	// in the event that they do, call a merge
+//
+// 	// if the user has specified that they do NOT want to merge at all, this worker should not be spawned
+// 	// if the user has specified that they only want to merge in a specified window, the worker should sleep until that window starts
+// }
 
 // Encode takes a key, value, and timestamp and returns a byte slice representing the record in the on-disk format.
 func encodeRecord(k, v []byte, tstamp uint32) []byte {
