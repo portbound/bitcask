@@ -266,29 +266,41 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 		return nil, fmt.Errorf("Get() failed: key %s not found", string(key))
 	}
 
-	// rebuild path to datafile and open
-	fileName := fmt.Sprintf("%04d.dat", kmv.FileId)
+	// rebuild path to the corresponding datafile and open
+	fileName := fmt.Sprintf(FmtFileName, kmv.FileId)
 	path := filepath.Join(b.opts.Dir, fileName)
-	file, err := os.Open(path)
+	dataFile, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer dataFile.Close()
 
-	// seek to value position
-	if _, err = file.Seek(int64(kmv.ValuePos), io.SeekStart); err != nil {
+	// seek to value position and read into buffer
+	// if _, err = dataFile.Seek(int64(kmv.ValuePos), io.SeekStart); err != nil {
+	// 	return nil, err
+	// }
+	if _, err = dataFile.Seek(int64(kmv.ValuePos-uint32(len(key)+16)), io.SeekStart); err != nil {
 		return nil, err
 	}
 
-	// read value into fixed length buffer
-	buf := make([]byte, kmv.ValueSize)
+	// value := make([]byte, kmv.ValueSize)
+	// if _, err := io.ReadFull(dataFile, value); err != nil {
+	// 	return nil, err
+	// }
 
-	// using io.ReadFull to ensure that an error is returned if fewer bytes are read
-	if _, err := io.ReadFull(file, buf); err != nil {
-		return nil, err
+	record := make([]byte, 16+len(key)+int(kmv.ValueSize))
+	if _, err := io.ReadFull(dataFile, record); err != nil {
+		return nil, fmt.Errorf("Get() failed: failed to read record: %v", err)
 	}
 
-	return buf, nil
+	crc := make([]byte, 4)
+	binary.BigEndian.PutUint32(crc, crc32.ChecksumIEEE(record[4:]))
+	if !slices.Equal(record[0:4], crc) {
+		return nil, fmt.Errorf("Get() failed: checksum does not verify")
+	}
+
+	// return value, nil
+	return record[16+len(key):], nil
 }
 
 func (b *Bitcask) Delete(k []byte) error {
