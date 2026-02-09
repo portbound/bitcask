@@ -2,18 +2,20 @@ package bitcask
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
+
+const FmtFileName = "%05d.dat"
 
 type MergePolicy int
 
@@ -167,20 +169,16 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 	b.opts.Dir = dir
 
 	// create datafile
-	fileName := fmt.Sprintf("%04d.dat", 1)
-	datafilePath := filepath.Join(dir, fileName)
-	datafile, err := os.OpenFile(datafilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+	fileName := fmt.Sprintf("%05d.dat", 1)
+	path := filepath.Join(dir, fileName)
+	datafile, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
 	b.datafile = datafile
 
-	// get new file FileInfo
-	stat, err := datafile.Stat()
-	if err != nil {
-		return nil, err
-	}
-	b.writePos = uint64(stat.Size())
+	// initialize writePos
+	b.writePos = 0
 
 	// create bitcask file lock
 	lockPath := filepath.Join(dir, ".lock")
@@ -209,13 +207,15 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 }
 
 func (b *Bitcask) Put(key, value []byte) error {
+	// prepare record
 	tstamp := uint32(time.Now().Unix())
 	encodedRecord := encodeRecord(key, value, tstamp)
 
+	// attempt to aquire full lock
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// rotate datafile if file size would exceed file size limit post write
+	// check to ensure we have enough space to write
 	if (b.writePos + uint64(len(encodedRecord))) > b.opts.MaxFileSize {
 		err := b.rotateDataFile()
 		if err != nil {
@@ -223,10 +223,8 @@ func (b *Bitcask) Put(key, value []byte) error {
 		}
 	}
 
-	// strip .dat from file name and convert to int for fileId
-	baseFileName := filepath.Base(b.datafile.Name())
-	// TODO need to revisit this
-	fileId, err := strconv.Atoi(strings.TrimRight(baseFileName, ".dat"))
+	// construct kmv
+	fileId, err := extractFileId(b.datafile.Name())
 	if err != nil {
 		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.datafile.Name()))
 	}
@@ -244,20 +242,16 @@ func (b *Bitcask) Put(key, value []byte) error {
 		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.datafile.Name()), err)
 	}
 
-	// sync?
-	if b.opts.SyncStrategy == SyncStrategy(Always) {
-		if err := b.datafile.Sync(); err != nil {
-			return fmt.Errorf("Put() failed: failed to sync %v", err)
+	// Attempt to sync
+	if b.opts.SyncStrategy != SyncStrategy(Never) {
+		if err := b.syncWrite(); err != nil {
+			return fmt.Errorf("Put() failed: %w", err)
 		}
 	}
 
-	// increment write pos and update map
+	// increment writePos and update keyMap
 	b.writePos += uint64(n)
 	b.keyMap[string(key)] = &kmv
-
-	// if b.opts.MergePolicy != Window {
-	// 	tryMerge()
-	// }
 
 	return nil
 }
@@ -301,51 +295,44 @@ func (b *Bitcask) Delete(k []byte) error {
 	// using an empty slice for tombstone value
 	var v []byte
 	return b.Put(k, v)
+	// delete is supposed to work by assigning that tombstone value to be cleaned up on the next merge, but wouldn't it be better if we just deleted the value from the keyMap? The way we're building merge, we don't really need this... we can just delete from the keyMap and since the merge is a sequential read on every single file where we perform a lookup on the map, if the key has been removed from the keyMap it will get swept up and removed
 }
 
 func (b *Bitcask) rotateDataFile() error {
-	// strip .dat from file name and convert to int for fileId
-	fileId, err := strconv.Atoi(strings.TrimRight(filepath.Base(b.datafile.Name()), ".dat"))
+	// copy the current fileId and increment by 1
+	fileId, err := extractFileId(b.datafile.Name())
 	if err != nil {
 		return err
 	}
-
-	// increment by one
 	fileId++
 
 	// check to ensure we won't overflow
 	if fileId > 65535 {
-		return errors.New("rotateDataFile() failed: cannot exceed uint16 (65535 bytes) for unique file identifier")
+		return fmt.Errorf("rotateDataFile() failed: cannot exceed uint16 (65535 bytes) for unique file identifier: %d", fileId)
 	}
 
-	// construct the new datafile name and path
-	fileName := fmt.Sprintf("%05d.dat", fileId)
+	// create the new datafile
+	fileName := fmt.Sprintf(FmtFileName, fileId)
 	path := filepath.Join(b.opts.Dir, fileName)
-
-	newDatafile, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+	newDatafile, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
-		return err
+		return fmt.Errorf("rotateDataFile() failed: failed to create new dataFile: %v", err)
 	}
 
-	// close the old file handle and point to the new datafile
-
+	// close the old file handle and set to readonly
 	os.Chmod(b.datafile.Name(), 0444)
 	b.datafile.Close()
-	b.datafile = newDatafile
 
-	// TODO, check this, but we need to move the write pos to 0 since this is a new file
-	stat, err := b.datafile.Stat()
-	if err != nil {
-		return err
-	}
-	b.writePos = uint64(stat.Size())
+	// set the new dataFile and reset the writePos
+	b.datafile = newDatafile
+	b.writePos = 0
 
 	return nil
 }
 
 // func (b *Bitcask) mergeWorker() {
 // 	// this should walk the filetree sequentially checking to see if the merge thresholds have been exceeded
-// 	//
+// 	// dont forget that this needs to handle the Delete() cleanup
 //
 // 	// maybe we make a merge method that get's called
 // 	entries, err := os.ReadDir(b.opts.Dir)
@@ -355,10 +342,10 @@ func (b *Bitcask) rotateDataFile() error {
 //
 // 	// we should try to aquire a read only lock here so we don't stop reads from working
 // 	// then, when we've assembled the mergefile and hint file, we can aquire the full lock to go ahead and delete the old data files
-// 	mergeFileName := fmt.Sprintf("m_%04d.dat", len(entries)+1)
+// 	mergeFileName := fmt.Sprintf("m_%05d.dat", len(entries)+1)
 // 	mergeFile, err := os.OpenFile(mergeFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0444)
 //
-// 	hintFileName := fmt.Sprintf("m_%04d.hint", len(entries)+1)
+// 	hintFileName := fmt.Sprintf("m_%05d.hint", len(entries)+1)
 // 	hintFile, err := os.OpenFile(hintFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0444)
 // 	for _, entry := range entries {
 // 		if entry.IsDir() || entry.Name() == b.datafile.Name() {
@@ -453,6 +440,8 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 
 	// leave the first 4 bytes empty to save room for the checksum
 	offset := 4
+
+	// build out the record
 	binary.BigEndian.PutUint32(buf[offset:], tstamp)
 	offset += 4
 	binary.BigEndian.PutUint32(buf[offset:], keyLen)
@@ -463,11 +452,15 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 	offset += len(k)
 	copy(buf[offset:], v)
 
-	// calculate checksum over the entire record (minus the checksum itself)
+	// prepend checksum
 	checksum := crc32.ChecksumIEEE(buf[4:])
 	binary.BigEndian.PutUint32(buf[0:4], checksum)
 
 	return buf
+}
+
+func extractFileId(fileName string) (int, error) {
+	return strconv.Atoi(strings.TrimRight(filepath.Base(fileName), ".dat"))
 }
 
 func merge() error {
@@ -489,5 +482,13 @@ func merge() error {
 	// update keyMap key entry to reference hint file?
 	// when finished iterating through keyMap, delete all old datafiles
 
+	return nil
+}
+
+func (b *Bitcask) syncWrite() error {
+	// need to add logic to handle Always vs Interval
+	if err := b.datafile.Sync(); err != nil {
+		return fmt.Errorf("syncWrite() failed: %v", err)
+	}
 	return nil
 }
