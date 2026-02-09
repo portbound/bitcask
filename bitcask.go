@@ -55,7 +55,7 @@ type MergeThresholds struct {
 type KeyMapValue struct {
 	FileId    uint16
 	ValueSize uint32
-	ValuePos  uint32
+	RecordPos uint32
 	Tstamp    uint32
 }
 
@@ -232,7 +232,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 	kmv := KeyMapValue{
 		FileId:    uint16(fileId),
 		ValueSize: uint32(len(value)),
-		ValuePos:  uint32(b.writePos + 16 + uint64(len(key))),
+		RecordPos: uint32(b.writePos),
 		Tstamp:    tstamp,
 	}
 
@@ -260,13 +260,13 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	// perform key lookup
+	// extract key
 	kmv, ok := b.keyMap[string(key)]
 	if !ok {
 		return nil, fmt.Errorf("Get() failed: key %s not found", string(key))
 	}
 
-	// rebuild path to the corresponding datafile and open
+	// open dataFile
 	fileName := fmt.Sprintf(FmtFileName, kmv.FileId)
 	path := filepath.Join(b.opts.Dir, fileName)
 	dataFile, err := os.Open(path)
@@ -275,31 +275,24 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	}
 	defer dataFile.Close()
 
-	// seek to value position and read into buffer
-	// if _, err = dataFile.Seek(int64(kmv.ValuePos), io.SeekStart); err != nil {
-	// 	return nil, err
-	// }
-	if _, err = dataFile.Seek(int64(kmv.ValuePos-uint32(len(key)+16)), io.SeekStart); err != nil {
+	// seek to the record position and read it
+	if _, err = dataFile.Seek(int64(kmv.RecordPos), io.SeekStart); err != nil {
 		return nil, err
 	}
-
-	// value := make([]byte, kmv.ValueSize)
-	// if _, err := io.ReadFull(dataFile, value); err != nil {
-	// 	return nil, err
-	// }
 
 	record := make([]byte, 16+len(key)+int(kmv.ValueSize))
 	if _, err := io.ReadFull(dataFile, record); err != nil {
 		return nil, fmt.Errorf("Get() failed: failed to read record: %v", err)
 	}
 
+	// verify checksum
 	crc := make([]byte, 4)
 	binary.BigEndian.PutUint32(crc, crc32.ChecksumIEEE(record[4:]))
 	if !slices.Equal(record[0:4], crc) {
 		return nil, fmt.Errorf("Get() failed: checksum does not verify")
 	}
 
-	// return value, nil
+	// return value
 	return record[16+len(key):], nil
 }
 
