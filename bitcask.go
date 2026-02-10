@@ -303,6 +303,14 @@ func (b *Bitcask) Delete(k []byte) error {
 	// delete is supposed to work by assigning that tombstone value to be cleaned up on the next merge, but wouldn't it be better if we just deleted the value from the keyMap? The way we're building merge, we don't really need this... we can just delete from the keyMap and since the merge is a sequential read on every single file where we perform a lookup on the map, if the key has been removed from the keyMap it will get swept up and removed
 }
 
+func (b *Bitcask) Close() {
+	b.cancel()
+	b.datafile.Close()
+	b.mu.Unlock()
+	// TODO need to make sure we close all other resources
+	// should we return an error?
+}
+
 func (b *Bitcask) rotateDataFile() error {
 	// copy the current fileId and increment by 1
 	fileId, err := extractFileId(b.datafile.Name())
