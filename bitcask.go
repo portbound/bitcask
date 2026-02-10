@@ -1,6 +1,7 @@
 package bitcask
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -72,6 +73,8 @@ type Bitcask struct {
 	writePos uint64
 	keyMap   map[string]*KeyMapValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
 	opts     bitcaskOpts
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 type bitcaskOpts struct {
@@ -156,6 +159,7 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 		keyMap: make(map[string]*KeyMapValue),
 		opts:   defaultOpts,
 	}
+	b.ctx, b.cancel = context.WithCancel(context.Background())
 
 	// override defaultOpts with user preferences
 	for _, opt := range opts {
@@ -196,13 +200,9 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 		return nil, err
 	}
 
-	// if b.opts.MergePolicy != Never {
-	// 	go b.mergeWorker()
-	// }
-
-	// if b.opts.MergePolicy == Window {
-	// 	go b.handleMergeWindow(b.opts.MergeWindowStart, b.opts.MergeWindowEnd)
-	// }
+	if b.opts.MergePolicy != Never {
+		go b.mergeWorker(b.ctx)
+	}
 
 	return &b, nil
 }
@@ -342,6 +342,22 @@ func (b *Bitcask) rotateDataFile() error {
 	b.writePos = 0
 
 	return nil
+}
+
+func (b *Bitcask) mergeWorker(ctx context.Context) {
+	ticker := time.NewTicker(b.opts.MergeInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+			if b.opts.MergePolicy == Window {
+				// if not within window, sleep
+
+			}
+		}
+	}
 }
 
 // func (b *Bitcask) mergeWorker() {
