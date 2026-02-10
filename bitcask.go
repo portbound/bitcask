@@ -42,12 +42,6 @@ const (
 	Interval // TODO not sure how to handle the 'interval' option in the spec without some sort of background worker listening for calls to sync... Think about it some more - may be worth moving to simpler implementation like the code below
 )
 
-// const (
-// 	SyncStrategyUnset SyncStrategy = iota
-// 	Disabled
-// 	Enabled
-// )
-
 type MergeTriggers struct {
 	Fragmentation int
 	DeadBytes     uint64
