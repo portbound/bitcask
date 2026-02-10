@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
+	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 func Test_encodeRecord(t *testing.T) {
@@ -48,6 +50,81 @@ func Test_encodeRecord(t *testing.T) {
 			got := encodeRecord(tt.k, tt.v, testTimestamp)
 			if !bytes.Equal(got, tt.want) {
 				t.Errorf("expected byte slice equality, got:%v want%v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNew(t *testing.T) {
+	tempDir := t.TempDir()
+	tests := []struct {
+		name string // description of this test case
+		// Named input parameters for target function.
+		opts    []func(*Bitcask)
+		want    *Bitcask
+		wantErr bool
+	}{
+		{
+			name: "vanilla: passing",
+			opts: []func(*Bitcask){
+				WithDir(tempDir),
+				WithMaxFileSize(999),
+				WithMergePolicy(MergePolicyConfig{
+					Policy:      Window,
+					WindowStart: 7,
+					WindowEnd:   8,
+				}),
+				WithMergeTriggers(
+					MergeTriggers{
+						Fragmentation: 10,
+						DeadBytes:     0,
+					},
+				),
+				WithMergeThreshold(MergeThresholds{
+					Fragmentation: 1,
+					DeadBytes:     2,
+					SmallFile:     3,
+				}),
+				WithMergeInterval(6 * time.Minute),
+				WithSyncStrategy(None),
+			},
+			want: &Bitcask{
+				opts: bitcaskOpts{
+					Dir:         filepath.Join(tempDir, "bitcask"),
+					MaxFileSize: 999,
+					MergePolicy: Window,
+					MergeTriggers: MergeTriggers{
+						Fragmentation: 10,
+						DeadBytes:     0,
+					},
+					MergeThresholds: MergeThresholds{
+						Fragmentation: 1,
+						DeadBytes:     2,
+						SmallFile:     3,
+					},
+					MergeInterval:    6 * time.Minute,
+					MergeWindowStart: 7,
+					MergeWindowEnd:   8,
+					SyncStrategy:     None,
+				},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, gotErr := New(tt.opts...)
+			if gotErr != nil {
+				if !tt.wantErr {
+					t.Errorf("New() failed: %v", gotErr)
+				}
+				return
+			}
+			if tt.wantErr {
+				t.Fatal("New() succeeded unexpectedly")
+			}
+			if got.opts != tt.want.opts {
+				t.Fatalf("New() failed, got: %v, want: %v", got.opts, tt.want.opts)
 			}
 		})
 	}
