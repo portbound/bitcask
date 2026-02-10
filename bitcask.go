@@ -26,6 +26,12 @@ const (
 	Window
 )
 
+type MergePolicyConfig struct {
+	Policy      MergePolicy
+	WindowStart int
+	WindowEnd   int
+}
+
 type SyncStrategy int
 
 const (
@@ -111,9 +117,11 @@ func WithMaxFileSize(size uint64) func(*Bitcask) {
 	}
 }
 
-func WithMergePolicy(policy MergePolicy) func(*Bitcask) {
+func WithMergePolicy(config MergePolicyConfig) func(*Bitcask) {
 	return func(b *Bitcask) {
-		b.opts.MergePolicy = policy
+		b.opts.MergePolicy = config.Policy
+		b.opts.MergeWindowStart = config.WindowStart
+		b.opts.MergeWindowEnd = config.WindowEnd
 	}
 }
 
@@ -132,13 +140,6 @@ func WithMergeThreshold(thresholds MergeThresholds) func(*Bitcask) {
 func WithMergeInterval(interval time.Duration) func(*Bitcask) {
 	return func(b *Bitcask) {
 		b.opts.MergeInterval = interval
-	}
-}
-
-func WithMergeWindow(start, end int) func(*Bitcask) {
-	return func(b *Bitcask) {
-		b.opts.MergeWindowStart = start
-		b.opts.MergeWindowEnd = end
 	}
 }
 
