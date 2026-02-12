@@ -83,6 +83,10 @@ type bitcaskOpts struct {
 	SyncStrategy     SyncStrategy
 }
 
+type mergeRequest struct {
+	respChan chan struct{}
+}
+
 var defaultOpts = bitcaskOpts{
 	Dir:         ".",
 	MaxFileSize: uint64(2 * 1024 * 1024 * 1024),
@@ -98,7 +102,7 @@ var defaultOpts = bitcaskOpts{
 	},
 	MergeInterval:    3 * time.Minute,
 	MergeWindowStart: 0,
-	MergeWindowEnd:   0,
+	MergeWindowEnd:   23,
 	SyncStrategy:     Always,
 }
 
@@ -117,6 +121,7 @@ func WithMaxFileSize(size uint64) func(*Bitcask) {
 func WithMergePolicy(config MergePolicyConfig) func(*Bitcask) {
 	return func(b *Bitcask) {
 		b.opts.MergePolicy = config.Policy
+		// need to sanitize these to ensure that we're not setting invalid values for the fields
 		b.opts.MergeWindowStart = config.WindowStart
 		b.opts.MergeWindowEnd = config.WindowEnd
 	}
@@ -195,7 +200,11 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 	}
 
 	if b.opts.MergePolicy != Never {
-		go b.mergeWorker(b.ctx)
+		// mergeRequests := make(chan struct{}, 1)
+		// should this be buffered or unbuffered?
+		mergeRequests := make(chan mergeRequest)
+		go b.fragWorker(b.ctx, mergeRequests)
+		go b.mergeWorker(b.ctx, mergeRequests)
 	}
 
 	return &b, nil
@@ -306,6 +315,61 @@ func (b *Bitcask) Close() {
 	// should we return an error?
 }
 
+func (b *Bitcask) merge() error {
+	return nil
+}
+
+func (b *Bitcask) fragWorker(ctx context.Context, ch chan mergeRequest) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		// may want a ticker so that we're not constantly walking? e.g. every 5 min?
+		// we can replace the default with a ticker then instead
+		default:
+			// walk the file tree checking for merge compatiblity
+
+			// when a merge is needed, stop walking, and send to channel
+			respChan := make(chan struct{})
+			ch <- mergeRequest{respChan: respChan}
+
+			// wait
+			select {
+			case <-ctx.Done():
+				return
+			case <-respChan:
+				continue
+			}
+		}
+	}
+}
+
+func (b *Bitcask) mergeWorker(ctx context.Context, ch chan mergeRequest) {
+	ticker := time.NewTicker(b.opts.MergeInterval)
+	defer ticker.Stop()
+
+	for {
+		if b.opts.MergePolicy == Window {
+			now := time.Now()
+			if b.opts.MergeWindowStart > now.Hour() || b.opts.MergeWindowEnd < now.Hour() {
+				target := time.Date(now.Year(), now.Month(), now.Day(), b.opts.MergeWindowStart, 0, 0, 0, now.Location())
+				if target.Before(now) {
+					target = target.Add(24 * time.Hour)
+				}
+				time.Sleep(time.Until(target))
+				continue
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// check the ch
+		}
+	}
+}
+
 func (b *Bitcask) rotateDataFile() error {
 	// copy the current fileId and increment by 1
 	fileId, err := extractFileId(b.datafile.Name())
@@ -338,121 +402,13 @@ func (b *Bitcask) rotateDataFile() error {
 	return nil
 }
 
-func (b *Bitcask) mergeWorker(ctx context.Context) {
-	ticker := time.NewTicker(b.opts.MergeInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-		case <-ticker.C:
-			if b.opts.MergePolicy == Window {
-				// if not within window, sleep
-
-			}
-		}
+func (b *Bitcask) syncWrite() error {
+	// need to add logic to handle Always vs Interval
+	if err := b.datafile.Sync(); err != nil {
+		return fmt.Errorf("syncWrite() failed: %v", err)
 	}
+	return nil
 }
-
-// func (b *Bitcask) mergeWorker() {
-// 	// this should walk the filetree sequentially checking to see if the merge thresholds have been exceeded
-// 	// dont forget that this needs to handle the Delete() cleanup
-//
-// 	// maybe we make a merge method that get's called
-// 	entries, err := os.ReadDir(b.opts.Dir)
-// 	if err != nil {
-// 		// do something
-// 	}
-//
-// 	// we should try to aquire a read only lock here so we don't stop reads from working
-// 	// then, when we've assembled the mergefile and hint file, we can aquire the full lock to go ahead and delete the old data files
-// 	mergeFileName := fmt.Sprintf("m_%05d.dat", len(entries)+1)
-// 	mergeFile, err := os.OpenFile(mergeFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0444)
-//
-// 	hintFileName := fmt.Sprintf("m_%05d.hint", len(entries)+1)
-// 	hintFile, err := os.OpenFile(hintFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0444)
-// 	for _, entry := range entries {
-// 		if entry.IsDir() || entry.Name() == b.datafile.Name() {
-// 			continue
-// 		}
-//
-// 		// if its a normal data file
-// 		file, err := os.Open(filepath.Join(b.opts.Dir, entry.Name()))
-// 		if err != nil {
-// 			// do something
-// 		}
-//
-// 		// read first 16 bytes
-// 		buf := make([]byte, 16)
-// 		_, err = io.ReadFull(file, buf)
-// 		if err != nil {
-// 			// do something
-// 		}
-//
-// 		// rebuild key
-// 		keySize := binary.BigEndian.Uint32(buf[8:12])
-// 		key := make([]byte, keySize)
-// 		_, err = io.ReadFull(file, key)
-// 		if err != nil {
-// 			// do something
-// 		}
-//
-// 		// check keyMap for key and continue if not present
-// 		val, ok := b.keyMap[string(key)]
-// 		if !ok {
-// 			continue
-// 		}
-//
-// 		// TODO need to revisit this logic here (and also inside Put())
-// 		baseFileName := filepath.Base(b.datafile.Name())
-// 		fileId, err := strconv.Atoi(strings.TrimRight(baseFileName, ".dat"))
-// 		if err != nil {
-// 			// do something
-// 		}
-//
-// 		// if this entry is not the active entry in the keyMap skip it
-// 		if val.FileId != uint16(fileId) {
-// 			continue
-// 		}
-//
-// 		valueSize := binary.BigEndian.Uint32(buf[12:16])
-// 		value := make([]byte, valueSize)
-// 		_, err = io.ReadFull(file, value)
-// 		if err != nil {
-// 			// do something
-// 		}
-//
-// 		record := make([]byte, 16+keySize+valueSize)
-// 		copy(record, buf)
-// 		offset := 16
-// 		copy(record[offset:], key)
-// 		offset += int(keySize)
-// 		copy(record[offset:], value)
-//
-// 		_, err = mergeFile.Write(record)
-// 		if err != nil {
-// 			// do something
-// 		}
-//
-// 		// tstamp, ksz, vsz, v_pos, key
-// 		var hOffset int
-// 		hint := make([]byte, 16+keySize)
-// 		binary.BigEndian.AppendUint32(hint, val.Tstamp)
-// 		binary.BigEndian.AppendUint32(hint, keySize)
-// 		binary.BigEndian.AppendUint32(hint, valueSize)
-//
-// 		_, err = hintFile.Write()
-//
-// 	}
-//
-// 	// after we've finished iterating over every file
-// 	// aquire
-//
-// 	// in the event that they do, call a merge
-//
-// 	// if the user has specified that they do NOT want to merge at all, this worker should not be spawned
-// 	// if the user has specified that they only want to merge in a specified window, the worker should sleep until that window starts
-// }
 
 // Encode takes a key, value, and timestamp and returns a byte slice representing the record in the on-disk format.
 func encodeRecord(k, v []byte, tstamp uint32) []byte {
@@ -485,34 +441,4 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 
 func extractFileId(fileName string) (int, error) {
 	return strconv.Atoi(strings.TrimRight(filepath.Base(fileName), ".dat"))
-}
-
-func merge() error {
-	// triggered by framentation and dead bytes
-	// both of which require knowledge of dead keys
-
-	// shelving this, apparently the random reads are slower based on how file IO actually works. Also the OS' readahead cache should make sequential reads significantly quicker
-	// going to keep it though because I want to test it to benchmark and see how much savings I can actually get
-	// For Science!!
-
-	// create mergefile
-	// create hintfile (shape of keyMap)
-	// for each key in keyMap
-	// if the file_id is not the active datafile
-	// open the file and seek to the end of the value
-	// copy the preceding 16 + len(k) + value_size
-	// attempt to append those bytes to the end of the mergefile (check size first)
-	// add entry to hintfile
-	// update keyMap key entry to reference hint file?
-	// when finished iterating through keyMap, delete all old datafiles
-
-	return nil
-}
-
-func (b *Bitcask) syncWrite() error {
-	// need to add logic to handle Always vs Interval
-	if err := b.datafile.Sync(); err != nil {
-		return fmt.Errorf("syncWrite() failed: %v", err)
-	}
-	return nil
 }
