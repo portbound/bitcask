@@ -320,20 +320,20 @@ func (b *Bitcask) merge() error {
 }
 
 func (b *Bitcask) fragWorker(ctx context.Context, ch chan mergeRequest) {
+	ticker := time.NewTicker(15 * time.Minute) // not sure how long we want to wait between walks
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		// may want a ticker so that we're not constantly walking? e.g. every 5 min?
-		// we can replace the default with a ticker then instead
-		default:
-			// walk the file tree checking for merge compatiblity
+		case <-ticker.C:
+			// TODO add logic to handle deadbyte/fragmentation check
+			// TODO add condition to return early if merge is not necessary
 
-			// when a merge is needed, stop walking, and send to channel
 			respChan := make(chan struct{})
 			ch <- mergeRequest{respChan: respChan}
 
-			// wait
 			select {
 			case <-ctx.Done():
 				return
@@ -365,7 +365,17 @@ func (b *Bitcask) mergeWorker(ctx context.Context, ch chan mergeRequest) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// check the ch
+			select {
+			case req := <-ch:
+				err := b.merge()
+				if err != nil {
+					// handle error
+				}
+
+				req.respChan <- struct{}{}
+			default:
+				continue
+			}
 		}
 	}
 }
