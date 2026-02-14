@@ -3,6 +3,7 @@ package bitcask
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -84,7 +85,7 @@ type bitcaskOpts struct {
 }
 
 type mergeRequest struct {
-	respChan chan struct{}
+	responseChan chan struct{}
 }
 
 var defaultOpts = bitcaskOpts{
@@ -165,7 +166,7 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 		opt(&b)
 	}
 
-	// create bitcask dir
+	// create bitcask working dir
 	dir := filepath.Join(b.opts.Dir, "bitcask")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
@@ -173,9 +174,7 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 	b.opts.Dir = dir
 
 	// create datafile
-	fileName := fmt.Sprintf("%05d.dat", 1)
-	path := filepath.Join(dir, fileName)
-	datafile, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+	datafile, err := os.OpenFile(filepath.Join(dir, fmt.Sprintf("%05d.dat", 1)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
@@ -319,25 +318,141 @@ func (b *Bitcask) merge() error {
 	return nil
 }
 
-func (b *Bitcask) fragWorker(ctx context.Context, ch chan mergeRequest) {
-	ticker := time.NewTicker(15 * time.Minute) // not sure how long we want to wait between walks
-	defer ticker.Stop()
+func (b *Bitcask) fragWorker(ctx context.Context, requestChan chan mergeRequest) {
+	// ticker := time.NewTicker(15 * time.Minute) // not sure how long we want to wait between walks
+	// defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			// TODO add logic to handle deadbyte/fragmentation check
-			// TODO add condition to return early if merge is not necessary
+		// case <-ticker.C:
+		default:
+			// list directory contents
+			entries, err := os.ReadDir(b.opts.Dir)
+			if err != nil {
+				// handle error
+			}
 
-			respChan := make(chan struct{})
-			ch <- mergeRequest{respChan: respChan}
+			var fragCount int
+			var deadByteCount int
+			var needsMerge bool
 
+			for _, entry := range entries {
+				// shouldn't be any directories here but checking anyway
+				if !entry.Type().IsRegular() {
+					continue
+				}
+
+				// only want to scan .dat and .mdat
+				_, fileExt, found := strings.Cut(entry.Name(), ".")
+				if !found {
+					continue
+				}
+
+				if fileExt != ".dat" && fileExt != ".mdat" {
+					continue
+				}
+
+				// open file for reading
+				file, err := os.Open(entry.Name())
+				if err != nil {
+					// handle error
+				}
+				defer file.Close()
+
+				// initialize buffer for record metadata
+				buf := make([]byte, 0, 16)
+				var pos int
+
+				for {
+					// reset buffer for subsequent reads
+					buf = buf[:0]
+
+					// read record metadata
+					_, err := io.ReadFull(file, buf)
+					if err != nil {
+						// could be the end of the file, so we check for io.EOF (no bytes read)
+						if errors.Is(err, io.EOF) {
+							continue
+						}
+
+						if errors.Is(err, io.ErrUnexpectedEOF) {
+							continue
+						}
+
+						// handle error
+					}
+					pos += len(buf)
+
+					// read key
+					keySize := binary.BigEndian.Uint32(buf[8:12])
+					key := make([]byte, keySize)
+					if _, err := io.ReadFull(file, key); err != nil {
+						if errors.Is(err, io.ErrUnexpectedEOF) {
+							continue
+						}
+
+						// handle error
+					}
+					pos += len(key)
+
+					// we don't actually need to know the value here, so we can avoid an unnecessary allocation and seek forward by the length of the value instead of reading it
+					valueSize := binary.BigEndian.Uint32(buf[12:16])
+					value := make([]byte, valueSize)
+					if _, err := io.ReadFull(file, value); err != nil {
+						if errors.Is(err, io.ErrUnexpectedEOF) {
+							continue
+						}
+						// handle error
+					}
+					pos += len(value)
+
+					// if the key is in the keyMap, check to see if the fileId matches
+					// if it does, check that the record position matches
+					// if it does, it's a live record, continue
+					if val, ok := b.keyMap[string(key)]; ok {
+						fileId, err := extractFileId(file.Name())
+						if err != nil {
+							// handle error
+						}
+
+						if val.FileId == uint16(fileId) {
+							if int(val.RecordPos) == pos-(len(buf)+len(key)+len(value)) {
+								continue
+							}
+						}
+					}
+
+					// increment counters
+					fragCount++
+					deadByteCount += int(16 + keySize + valueSize)
+
+					if fragCount >= b.opts.MergeThresholds.Fragmentation {
+						needsMerge = true
+						break
+					}
+
+					if deadByteCount >= int(b.opts.MergeThresholds.DeadBytes) {
+						needsMerge = true
+						break
+					}
+				}
+			}
+
+			if !needsMerge {
+				continue
+			}
+
+			// construct response channel for the mergeWorker to signal on
+			responseChan := make(chan struct{})
+			requestChan <- mergeRequest{responseChan: responseChan}
+
+			// wait until merge is complete or program exits
 			select {
 			case <-ctx.Done():
 				return
-			case <-respChan:
+			case <-responseChan:
 				continue
 			}
 		}
@@ -372,7 +487,7 @@ func (b *Bitcask) mergeWorker(ctx context.Context, ch chan mergeRequest) {
 					// handle error
 				}
 
-				req.respChan <- struct{}{}
+				req.responseChan <- struct{}{}
 			default:
 				continue
 			}
@@ -452,3 +567,7 @@ func encodeRecord(k, v []byte, tstamp uint32) []byte {
 func extractFileId(fileName string) (int, error) {
 	return strconv.Atoi(strings.TrimRight(filepath.Base(fileName), ".dat"))
 }
+
+// TODOS
+// do we need a ticker for the fragworker? or should it just always walk the dir?
+// should mergeRequests be buffered or unbuffered?
