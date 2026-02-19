@@ -60,52 +60,39 @@ func TestNew(t *testing.T) {
 	tests := []struct {
 		name string // description of this test case
 		// Named input parameters for target function.
-		opts    []func(*Bitcask)
+		opts    []Option
 		want    *Bitcask
 		wantErr bool
 	}{
 		{
 			name: "vanilla: passing",
-			opts: []func(*Bitcask){
-				WithDir(tempDir),
+			opts: []Option{
+				WithRootDir(tempDir),
 				WithMaxFileSize(999),
-				WithMergePolicy(MergePolicyConfig{
-					Policy:      Window,
-					WindowStart: 7,
-					WindowEnd:   8,
+				WithMergePolicy(MergePolicy{
+					Strategy:          MergeStrategyWindow,
+					Interval:          6 * time.Minute,
+					WindowStart:       6,
+					WindowEnd:         7,
+					FragThreshold:     10,
+					DeadByteThreshold: 0,
 				}),
-				WithMergeTriggers(
-					MergeTriggers{
-						Fragmentation: 10,
-						DeadBytes:     0,
-					},
-				),
-				WithMergeThreshold(MergeThresholds{
-					Fragmentation: 1,
-					DeadBytes:     2,
-					SmallFile:     3,
-				}),
-				WithMergeInterval(6 * time.Minute),
-				WithSyncStrategy(None),
+				WithSyncStrategy(SyncNone),
 			},
 			want: &Bitcask{
 				opts: bitcaskOpts{
-					Dir:         filepath.Join(tempDir, "bitcask"),
+					RootDir:     filepath.Join(tempDir, "bitcask"),
+					DataDir:     filepath.Join(tempDir, "bitcask", "data"),
 					MaxFileSize: 999,
-					MergePolicy: Window,
-					MergeTriggers: MergeTriggers{
-						Fragmentation: 10,
-						DeadBytes:     0,
+					MergePolicy: MergePolicy{
+						Strategy:          MergeStrategyWindow,
+						Interval:          6 * time.Minute,
+						WindowStart:       6,
+						WindowEnd:         7,
+						FragThreshold:     10,
+						DeadByteThreshold: 0,
 					},
-					MergeThresholds: MergeThresholds{
-						Fragmentation: 1,
-						DeadBytes:     2,
-						SmallFile:     3,
-					},
-					MergeInterval:    6 * time.Minute,
-					MergeWindowStart: 7,
-					MergeWindowEnd:   8,
-					SyncStrategy:     None,
+					SyncStrategy: SyncNone,
 				},
 			},
 			wantErr: false,
@@ -144,7 +131,7 @@ func TestBitcask_Put(t *testing.T) {
 			v:       []byte("value"),
 			wantErr: false,
 			setup: func(t *testing.T) *Bitcask {
-				b, err := New(WithDir(t.TempDir()))
+				b, err := New(WithRootDir(t.TempDir()))
 				if err != nil {
 					t.Fatalf("could not construct receiver type: %v", err)
 				}
@@ -157,7 +144,7 @@ func TestBitcask_Put(t *testing.T) {
 			v:       []byte("value"),
 			wantErr: false,
 			setup: func(t *testing.T) *Bitcask {
-				b, err := New(WithDir(t.TempDir()))
+				b, err := New(WithRootDir(t.TempDir()))
 				if err != nil {
 					t.Fatalf("could not construct receiver type: %v", err)
 				}
@@ -199,7 +186,7 @@ func TestBitcask_Get(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, err := New(WithDir(t.TempDir()))
+			b, err := New(WithRootDir(t.TempDir()))
 			if err != nil {
 				t.Fatalf("could not construct receiver type: %v", err)
 			}
@@ -238,7 +225,7 @@ func TestBitcask_Delete(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, err := New(WithDir(t.TempDir()))
+			b, err := New(WithRootDir(t.TempDir()))
 			if err != nil {
 				t.Fatalf("could not construct receiver type: %v", err)
 			}
