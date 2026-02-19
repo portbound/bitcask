@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -62,18 +63,22 @@ type KeyMapValue struct {
 }
 
 type Bitcask struct {
-	lock     *os.File
-	mu       sync.RWMutex
-	datafile *os.File
-	writePos uint64
-	keyMap   map[string]*KeyMapValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
-	opts     bitcaskOpts
-	ctx      context.Context
-	cancel   context.CancelFunc
+	lock       *os.File
+	mu         sync.RWMutex
+	datafile   *os.File
+	writePos   uint64
+	keyMap     map[string]*KeyMapValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
+	opts       bitcaskOpts
+	logger     *slog.Logger
+	totalBytes int
+	liveBytes  int
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 type bitcaskOpts struct {
-	Dir              string
+	RootDir          string
+	DataDir          string
 	MaxFileSize      uint64
 	MergePolicy      MergePolicy
 	MergeTriggers    MergeTriggers
@@ -89,7 +94,8 @@ type mergeRequest struct {
 }
 
 var defaultOpts = bitcaskOpts{
-	Dir:         ".",
+	RootDir: ".",
+	// DataDir:     "./data",
 	MaxFileSize: uint64(2 * 1024 * 1024 * 1024),
 	MergePolicy: Unrestricted,
 	MergeTriggers: MergeTriggers{
@@ -109,7 +115,7 @@ var defaultOpts = bitcaskOpts{
 
 func WithDir(dir string) func(*Bitcask) {
 	return func(b *Bitcask) {
-		b.opts.Dir = dir
+		b.opts.RootDir = dir
 	}
 }
 
@@ -166,15 +172,22 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 		opt(&b)
 	}
 
-	// create bitcask working dir
-	dir := filepath.Join(b.opts.Dir, "bitcask")
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	// create bitcask working rootDir
+	rootDir := filepath.Join(b.opts.RootDir, "bitcask")
+	if err := os.MkdirAll(rootDir, 0755); err != nil {
 		return nil, err
 	}
-	b.opts.Dir = dir
+	b.opts.RootDir = rootDir
+
+	// create bitcask dataDir
+	dataDir := filepath.Join(b.opts.RootDir, "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, err
+	}
+	b.opts.DataDir = dataDir
 
 	// create datafile
-	datafile, err := os.OpenFile(filepath.Join(dir, fmt.Sprintf("%05d.dat", 1)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+	datafile, err := os.OpenFile(filepath.Join(b.opts.DataDir, fmt.Sprintf("%05d.dat", 1)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +197,7 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 	b.writePos = 0
 
 	// create bitcask file lock
-	lockPath := filepath.Join(dir, ".lock")
+	lockPath := filepath.Join(rootDir, ".lock")
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
@@ -197,6 +210,13 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 		lock.Close()
 		return nil, err
 	}
+
+	// set up logging
+	errorLog, err := os.OpenFile(b.opts.RootDir, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		return nil, err
+	}
+	b.logger = slog.New(slog.NewJSONHandler(errorLog, nil))
 
 	if b.opts.MergePolicy != Never {
 		// mergeRequests := make(chan struct{}, 1)
@@ -212,14 +232,14 @@ func New(opts ...func(*Bitcask)) (*Bitcask, error) {
 func (b *Bitcask) Put(key, value []byte) error {
 	// prepare record
 	tstamp := uint32(time.Now().Unix())
-	encodedRecord := encodeRecord(key, value, tstamp)
+	record := encodeRecord(key, value, tstamp)
 
 	// attempt to aquire full lock
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	// check to ensure we have enough space to write
-	if (b.writePos + uint64(len(encodedRecord))) > b.opts.MaxFileSize {
+	if (b.writePos + uint64(len(record))) > b.opts.MaxFileSize {
 		err := b.rotateDataFile()
 		if err != nil {
 			return fmt.Errorf("Put() failed: failed to rotate datafile: %v", err)
@@ -240,7 +260,7 @@ func (b *Bitcask) Put(key, value []byte) error {
 	}
 
 	// setup done, write record to datafile
-	n, err := b.datafile.Write(encodedRecord)
+	n, err := b.datafile.Write(record)
 	if err != nil {
 		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.datafile.Name()), err)
 	}
@@ -254,6 +274,16 @@ func (b *Bitcask) Put(key, value []byte) error {
 
 	// increment writePos and update keyMap
 	b.writePos += uint64(n)
+
+	// if we're overwriting a key, we need to increment the dead bytes counter
+	if val, ok := b.keyMap[string(key)]; !ok {
+		b.totalBytes += len(record)
+		b.liveBytes += len(record)
+	} else {
+		b.totalBytes += len(record)
+		b.liveBytes += len(record) - (16 + len(key) + int(val.ValueSize))
+	}
+
 	b.keyMap[string(key)] = &kmv
 
 	return nil
@@ -271,7 +301,7 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 
 	// open dataFile
 	fileName := fmt.Sprintf(FmtFileName, kmv.FileId)
-	path := filepath.Join(b.opts.Dir, fileName)
+	path := filepath.Join(b.opts.DataDir, fileName)
 	dataFile, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -318,146 +348,149 @@ func (b *Bitcask) merge() error {
 	return nil
 }
 
-func (b *Bitcask) fragWorker(ctx context.Context, requestChan chan mergeRequest) {
-	// ticker := time.NewTicker(15 * time.Minute) // not sure how long we want to wait between walks
-	// defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		// case <-ticker.C:
-		default:
-			// list directory contents
-			entries, err := os.ReadDir(b.opts.Dir)
-			if err != nil {
-				// handle error
-			}
-
-			var fragCount int
-			var deadByteCount int
-			var needsMerge bool
-
-			for _, entry := range entries {
-				// shouldn't be any directories here but checking anyway
-				if !entry.Type().IsRegular() {
-					continue
-				}
-
-				// only want to scan .dat and .mdat
-				_, fileExt, found := strings.Cut(entry.Name(), ".")
-				if !found {
-					continue
-				}
-
-				if fileExt != ".dat" && fileExt != ".mdat" {
-					continue
-				}
-
-				// open file for reading
-				file, err := os.Open(entry.Name())
-				if err != nil {
-					// handle error
-				}
-				defer file.Close()
-
-				// initialize buffer for record metadata
-				buf := make([]byte, 0, 16)
-				var pos int
-
-				for {
-					// reset buffer for subsequent reads
-					buf = buf[:0]
-
-					// read record metadata
-					_, err := io.ReadFull(file, buf)
-					if err != nil {
-						// could be the end of the file, so we check for io.EOF (no bytes read)
-						if errors.Is(err, io.EOF) {
-							continue
-						}
-
-						if errors.Is(err, io.ErrUnexpectedEOF) {
-							continue
-						}
-
-						// handle error
-					}
-					pos += len(buf)
-
-					// read key
-					keySize := binary.BigEndian.Uint32(buf[8:12])
-					key := make([]byte, keySize)
-					if _, err := io.ReadFull(file, key); err != nil {
-						if errors.Is(err, io.ErrUnexpectedEOF) {
-							continue
-						}
-
-						// handle error
-					}
-					pos += len(key)
-
-					// we don't actually need to know the value here, so we can avoid an unnecessary allocation and seek forward by the length of the value instead of reading it
-					valueSize := binary.BigEndian.Uint32(buf[12:16])
-					value := make([]byte, valueSize)
-					if _, err := io.ReadFull(file, value); err != nil {
-						if errors.Is(err, io.ErrUnexpectedEOF) {
-							continue
-						}
-						// handle error
-					}
-					pos += len(value)
-
-					// if the key is in the keyMap, check to see if the fileId matches
-					// if it does, check that the record position matches
-					// if it does, it's a live record, continue
-					if val, ok := b.keyMap[string(key)]; ok {
-						fileId, err := extractFileId(file.Name())
-						if err != nil {
-							// handle error
-						}
-
-						if val.FileId == uint16(fileId) {
-							if int(val.RecordPos) == pos-(len(buf)+len(key)+len(value)) {
-								continue
-							}
-						}
-					}
-
-					// increment counters
-					fragCount++
-					deadByteCount += int(16 + keySize + valueSize)
-
-					if fragCount >= b.opts.MergeThresholds.Fragmentation {
-						needsMerge = true
-						break
-					}
-
-					if deadByteCount >= int(b.opts.MergeThresholds.DeadBytes) {
-						needsMerge = true
-						break
-					}
-				}
-			}
-
-			if !needsMerge {
-				continue
-			}
-
-			// construct response channel for the mergeWorker to signal on
-			responseChan := make(chan struct{})
-			requestChan <- mergeRequest{responseChan: responseChan}
-
-			// wait until merge is complete or program exits
-			select {
-			case <-ctx.Done():
-				return
-			case <-responseChan:
-				continue
-			}
-		}
-	}
-}
+// func (b *Bitcask) fragWorker(ctx context.Context, requestChan chan mergeRequest) {
+// 	for {
+// 		select {
+// 		case <-ctx.Done():
+// 			return
+// 		default:
+// 			// get all dir entries
+// 			entries, err := os.ReadDir(b.opts.DataDir)
+// 			if err != nil {
+// 				errMsg := fmt.Sprintf("fragWorker() failed to read directory contents for %s: %v", b.opts.DataDir, err)
+// 				b.logger.Error(errMsg)
+// 			}
+//
+// 			var fragCount int
+// 			var deadByteCount int
+// 			// var needsMerge bool
+//
+// 			for _, entry := range entries {
+// 				// shouldn't be any directories here but checking anyway
+// 				if !entry.Type().IsRegular() {
+// 					continue
+// 				}
+//
+// 				// strip file extension
+// 				_, fileExt, found := strings.Cut(entry.Name(), ".")
+// 				if !found {
+// 					continue
+// 				}
+//
+// 				// only want to scan .dat and .mdat
+// 				if fileExt != ".dat" && fileExt != ".mdat" {
+// 					continue
+// 				}
+//
+// 				// open file for reading
+// 				file, err := os.Open(entry.Name())
+// 				if err != nil {
+// 					errMsg := fmt.Sprintf("fragWorker() failed to open file %s for reading: %v", entry.Name(), err)
+// 					b.logger.Error(errMsg)
+// 				}
+// 				defer file.Close()
+//
+// 				// initialize buffer for record metadata
+// 				buf := make([]byte, 0, 16)
+// 				var pos int
+//
+// 				for {
+// 					// reset buffer for each record
+// 					buf = buf[:0]
+//
+// 					// attempt to read the first 16 bytes of metadata
+// 					n, err := io.ReadFull(file, buf)
+// 					if err != nil {
+// 						if errors.Is(err, io.EOF) {
+// 							break
+// 						}
+//
+// 						errMsg := fmt.Sprintf("fragWorker() failed to read metadata at pos %d: read %d bytes from file %s: %v", pos, n, entry.Name(), err)
+// 						b.logger.Error(errMsg)
+// 						break
+// 					}
+// 					pos += len(buf)
+//
+// 					// read key
+// 					keySize := binary.BigEndian.Uint32(buf[8:12])
+// 					key := make([]byte, keySize)
+// 					if _, err := io.ReadFull(file, key); err != nil {
+// 						if errors.Is(err, io.EOF) {
+// 							break
+// 						}
+//
+// 						errMsg := fmt.Sprintf("fragWorker() failed to read key at pos %d: read %d bytes from file %s: %v", pos, n, entry.Name(), err)
+// 						b.logger.Error(errMsg)
+// 						break
+// 					}
+// 					pos += len(key)
+//
+// 					// read value
+// 					valueSize := binary.BigEndian.Uint32(buf[12:16])
+// 					value := make([]byte, valueSize)
+// 					if _, err := io.ReadFull(file, value); err != nil {
+// 						if errors.Is(err, io.ErrUnexpectedEOF) {
+// 							break
+// 						}
+//
+// 						errMsg := fmt.Sprintf("fragWorker() failed to read value at pos %d: read %d bytes from file %s: %v", pos, n, entry.Name(), err)
+// 						b.logger.Error(errMsg)
+// 						break
+// 					}
+// 					pos += len(value)
+//
+// 					// if the key is in the keyMap, check to see if the fileId matches
+// 					// if it does, check that the record position matches
+// 					// if it does, it's a live record, continue
+// 					if val, ok := b.keyMap[string(key)]; ok {
+// 						fileId, err := extractFileId(file.Name())
+// 						if err != nil {
+// 							errMsg := fmt.Sprintf("fragWorker() failed to read value at pos %d: read %d bytes from file %s: %v", pos, n, entry.Name(), err)
+// 							b.logger.Error(errMsg)
+// 							break
+// 						}
+//
+// 						if val.FileId == uint16(fileId) {
+// 							if int(val.RecordPos) == pos-(len(buf)+len(key)+len(value)) {
+// 								continue
+// 							}
+// 						}
+// 					}
+//
+// 					// increment counters
+// 					fragCount++
+// 					deadByteCount += int(16 + keySize + valueSize)
+//
+// 					if fragCount >= b.opts.MergeThresholds.Fragmentation {
+// 						needsMerge = true
+// 						break
+// 					}
+//
+// 					if deadByteCount >= int(b.opts.MergeThresholds.DeadBytes) {
+// 						needsMerge = true
+// 						break
+// 					}
+// 				}
+// 			}
+//
+// 			if !needsMerge {
+// 				continue
+// 			}
+//
+// 			// construct response channel for the mergeWorker to signal on
+// 			responseChan := make(chan struct{})
+// 			requestChan <- mergeRequest{responseChan: responseChan}
+//
+// 			// wait until merge is complete or program exits
+// 			select {
+// 			case <-ctx.Done():
+// 				return
+// 			case <-responseChan:
+// 				continue
+// 			}
+// 		}
+// 	}
+// }
 
 func (b *Bitcask) mergeWorker(ctx context.Context, ch chan mergeRequest) {
 	ticker := time.NewTicker(b.opts.MergeInterval)
@@ -481,15 +514,6 @@ func (b *Bitcask) mergeWorker(ctx context.Context, ch chan mergeRequest) {
 			return
 		case <-ticker.C:
 			select {
-			case req := <-ch:
-				err := b.merge()
-				if err != nil {
-					// handle error
-				}
-
-				req.responseChan <- struct{}{}
-			default:
-				continue
 			}
 		}
 	}
@@ -510,7 +534,7 @@ func (b *Bitcask) rotateDataFile() error {
 
 	// create the new datafile
 	fileName := fmt.Sprintf(FmtFileName, fileId)
-	path := filepath.Join(b.opts.Dir, fileName)
+	path := filepath.Join(b.opts.DataDir, fileName)
 	newDatafile, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
 		return fmt.Errorf("rotateDataFile() failed: failed to create new dataFile: %v", err)
@@ -571,3 +595,54 @@ func extractFileId(fileName string) (int, error) {
 // TODOS
 // do we need a ticker for the fragworker? or should it just always walk the dir?
 // should mergeRequests be buffered or unbuffered?
+
+
+
+  A "Rethink" Design: The Global Efficiency Model
+
+  Instead of per-file workers or per-file maps, use a Global Accounting approach.
+
+
+  The Accounting (In-Memory Only)
+  Add two simple counters to your Bitcask struct:
+   1. `totalDiskBytes`: The sum of all bytes in all data files (easy to update on every Put).
+   2. `liveBytes`: The sum of all bytes currently pointed to by the keyMap.
+
+
+  How you update them:
+   * `Put(newKey)`: totalDiskBytes += newSize, liveBytes += newSize.
+   * `Put(existingKey)`: totalDiskBytes += newSize, liveBytes += (newSize - oldSize).
+   * `Delete(key)`: totalDiskBytes += tombstoneSize, liveBytes -= oldSize.
+
+  The Trigger
+  Now, your "decision" logic is $O(1)$ and requires zero disk I/O:
+
+
+   1 fragmentation := 1.0 - (float64(b.liveBytes) / float64(b.totalDiskBytes))
+   2 if fragmentation > 0.60 { // 60% of our disk is "garbage"
+   3     b.triggerMerge()
+   4 }
+
+
+  The Merge (The Only Worker)
+  When the trigger hits (or the timer/window), a single mergeWorker does a single pass:
+
+
+   1. Snapshot the files: Get a list of all immutable files (everything except the active one).
+   2. Sequential Read: For each file, read it from start to finish.
+   3. The "Live" Check: For every record read:
+       * Look up the key in the keyMap.
+       * Does the keyMap say this key is at this file ID and this position?
+       * Yes: It's live! Write it to a new merged file and update the keyMap.
+       * No: It's dead. Ignore it.
+   4. Cleanup: Delete the old files.
+
+
+  Why this is the "Optimal" Path:
+   1. Redundancy is gone: There is no "Frag Worker." The decision to merge is based on a mathematical calculation of two numbers you are already maintaining in memory.
+   2. I/O is minimized: You only ever read an old file when you have already committed to merging it.
+   3. Simplicity: You don't need to track which file is fragmented. If the system as a whole is 60% fragmented, you just clean up all the old stuff. This is exactly how the original Bitcask/Riak design handled
+      it.
+   4. Locking: You only need to lock the keyMap for a tiny fraction of a second when you "re-point" a live record to its new home in the merged file.
+
+
