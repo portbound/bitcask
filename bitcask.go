@@ -17,25 +17,33 @@ import (
 )
 
 type Bitcask struct {
-	lock       *os.File
-	mu         sync.RWMutex
-	datafile   *os.File
-	writePos   uint64
-	keyMap     map[string]*KeyMapValue // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
-	opts       bitcaskOpts
-	logger     *slog.Logger
-	totalBytes int
-	deadBytes  int
-	ctx        context.Context
-	cancel     context.CancelFunc
+	lock           *os.File
+	mu             sync.RWMutex
+	activeDatafile *os.File
+	writePosition  uint64
+	keys           map[string]*ValuePtr // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
+	opts           bitcaskOpts
+	logger         *slog.Logger
+	totalBytes     uint64
+	deadBytes      uint64
+	ctx            context.Context
+	cancel         context.CancelFunc
+}
+
+// ValuePtr represents the location and metadata of a key in a data file.
+type ValuePtr struct {
+	FileId         uint16
+	ValueSize      uint32
+	RecordPosition uint32
+	Timestamp      uint32
 }
 
 // TODO: revisit the structure of New to make sure the order of logic makes sense
 func New(opts ...Option) (*Bitcask, error) {
 	b := Bitcask{
-		mu:     sync.RWMutex{},
-		keyMap: make(map[string]*KeyMapValue),
-		opts:   defaultOpts,
+		mu:   sync.RWMutex{},
+		keys: make(map[string]*ValuePtr),
+		opts: defaultOpts,
 	}
 	b.ctx, b.cancel = context.WithCancel(context.Background())
 
@@ -44,94 +52,95 @@ func New(opts ...Option) (*Bitcask, error) {
 		opt(&b)
 	}
 
-	// create bitcask working rootDir
-	rootDir := filepath.Join(b.opts.RootDir, "bitcask")
-	if err := os.MkdirAll(rootDir, 0755); err != nil {
+	// create working parentDir
+	parentDir := filepath.Join(b.opts.ParentDir, "bitcask")
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		return nil, err
 	}
-	b.opts.RootDir = rootDir
+	b.opts.ParentDir = parentDir
 
-	// create bitcask dataDir
-	dataDir := filepath.Join(b.opts.RootDir, "data")
+	// create dataDir
+	dataDir := filepath.Join(b.opts.ParentDir, "data")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, err
 	}
 	b.opts.DataDir = dataDir
 
-	// create datafile
+	// create datafile and initialize write position
 	datafile, err := os.OpenFile(b.dataFilePath(1), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
-	b.datafile = datafile
+	// Not closing this until b.Close is called
+
+	b.activeDatafile = datafile
+	// b.writePosition = 0
+	// I don't think we need this since the 0 value of a uint64 is 0
 
 	// create error log
-	errorLog, err := os.OpenFile(filepath.Join(b.opts.RootDir, "error.log"), os.O_CREATE|os.O_RDWR, 0666)
+	errorLog, err := os.OpenFile(filepath.Join(b.opts.ParentDir, "error.log"), os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
+	defer errorLog.Close()
 	b.logger = slog.New(slog.NewJSONHandler(errorLog, nil))
 
-	// initialize writePos
-	b.writePos = 0
-
-	// create bitcask file lock
-	lockPath := filepath.Join(rootDir, ".lock")
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0666)
+	// create file lock
+	lock, err := os.OpenFile(filepath.Join(parentDir, ".lock"), os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
+	defer lock.Close()
 	b.lock = lock
 
-	// aquire bitcask file lock
+	// aquire file lock
+	// TODO: need to figure out how to implement this lock to ensure when we resurrect a bitcask this is respected
 	err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		lock.Close()
 		return nil, err
 	}
 
+	// attempt to initiate merge worker
 	if b.opts.MergePolicy.Strategy != MergeStrategyNever {
-		// mergeRequests := make(chan struct{}, 1)
-		// should this be buffered or unbuffered?
 		go b.mergeWorker(b.ctx)
 	}
 
 	return &b, nil
 }
 
-func (b *Bitcask) Put(key, value []byte) error {
-	tstamp := uint32(time.Now().Unix())
-	record := encodeRecord(key, value, tstamp)
+func (b *Bitcask) Put(k, v []byte) error {
+	timestamp := uint32(time.Now().Unix())
+	record := encodeRecord(k, v, timestamp)
 
-	// attempt to aquire full lock
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	// check to ensure we have enough space to write
-	if (b.writePos + uint64(len(record))) > b.opts.MaxFileSize {
+	if (b.writePosition + uint64(len(record))) > b.opts.MaxFileSize {
 		err := b.rotateDataFile()
 		if err != nil {
 			return fmt.Errorf("Put() failed: failed to rotate datafile: %v", err)
 		}
 	}
 
-	// construct kmv
 	fileId, err := b.activeFileId()
 	if err != nil {
-		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.datafile.Name()))
+		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.activeDatafile.Name()))
 	}
 
-	kmv := KeyMapValue{
-		FileId:    uint16(fileId),
-		ValueSize: uint32(len(value)),
-		RecordPos: uint32(b.writePos),
-		Tstamp:    tstamp,
+	// construct ptr for key map
+	ptr := ValuePtr{
+		FileId:         uint16(fileId),
+		ValueSize:      uint32(len(v)),
+		RecordPosition: uint32(b.writePosition),
+		Timestamp:      timestamp,
 	}
 
 	// setup done, write record to datafile
-	n, err := b.datafile.Write(record)
+	n, err := b.activeDatafile.Write(record)
 	if err != nil {
-		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.datafile.Name()), err)
+		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.activeDatafile.Name()), err)
 	}
 
 	// Attempt to sync
@@ -142,43 +151,42 @@ func (b *Bitcask) Put(key, value []byte) error {
 	}
 
 	// increment writePos and update keyMap
-	b.writePos += uint64(n)
+	b.writePosition += uint64(n)
 
 	// if we're overwriting a record, increment the deadBytes counter by the length of the previous key
-	if val, ok := b.keyMap[string(key)]; ok {
-		b.deadBytes += 16 + len(key) + int(val.ValueSize)
+	if ptr, ok := b.keys[string(k)]; ok {
+		b.deadBytes += uint64((16 + len(k) + int(ptr.ValueSize)*1024*1024))
 	}
 
-	b.totalBytes += len(record)
-	b.keyMap[string(key)] = &kmv
+	b.totalBytes += uint64(len(record) * 1024 * 1024)
+	b.keys[string(k)] = &ptr
 
 	return nil
 }
 
-func (b *Bitcask) Get(key []byte) ([]byte, error) {
+func (b *Bitcask) Get(k []byte) ([]byte, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	// extract key
-	kmv, ok := b.keyMap[string(key)]
+	hint, ok := b.keys[string(k)]
 	if !ok {
-		return nil, fmt.Errorf("Get() failed: key %s not found", string(key))
+		return nil, fmt.Errorf("Get() failed: key %s not found", string(k))
 	}
 
 	// open dataFile
-	path := b.dataFilePath(kmv.FileId)
-	dataFile, err := os.Open(path)
+	dataFile, err := os.Open(b.dataFilePath(hint.FileId))
 	if err != nil {
 		return nil, err
 	}
 	defer dataFile.Close()
 
 	// seek to the record position and read it
-	if _, err = dataFile.Seek(int64(kmv.RecordPos), io.SeekStart); err != nil {
+	if _, err = dataFile.Seek(int64(hint.RecordPosition), io.SeekStart); err != nil {
 		return nil, err
 	}
 
-	record := make([]byte, 16+len(key)+int(kmv.ValueSize))
+	record := make([]byte, 16+len(k)+int(hint.ValueSize))
 	if _, err := io.ReadFull(dataFile, record); err != nil {
 		return nil, fmt.Errorf("Get() failed: failed to read record: %v", err)
 	}
@@ -191,7 +199,7 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	}
 
 	// return value
-	return record[16+len(key):], nil
+	return record[16+len(k):], nil
 }
 
 func (b *Bitcask) Delete(k []byte) error {
@@ -203,7 +211,7 @@ func (b *Bitcask) Delete(k []byte) error {
 func (b *Bitcask) Close() {
 	b.mu.Lock()
 	b.cancel()
-	b.datafile.Close()
+	b.activeDatafile.Close()
 	b.mu.Unlock()
 	// TODO: need to make sure we close all other resources
 	// should we return an error?
@@ -230,14 +238,18 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// check thresholds and merge if necessary
+			if b.deadBytes >= b.opts.MergePolicy.DeadByteThreshold {
+			}
+
+			if (uint8(b.deadBytes) / uint8(b.totalBytes)) >= b.opts.MergePolicy.FragThreshold {
+			}
 		}
 	}
 }
 
 func (b *Bitcask) rotateDataFile() error {
 	// copy the current fileId and increment by 1
-	fileId, err := b.activeFileId()
+	fileId, err := parseFileId(b.activeDatafile.Name())
 	if err != nil {
 		return err
 	}
@@ -249,26 +261,27 @@ func (b *Bitcask) rotateDataFile() error {
 	fileId++
 
 	// create the new datafile
-	path := b.dataFilePath(fileId)
-	newDatafile, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+	newDatafilePath := b.dataFilePath(fileId)
+	newDatafile, err := os.OpenFile(newDatafilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
 		return fmt.Errorf("rotateDataFile() failed: failed to create new dataFile: %v", err)
 	}
+	defer newDatafile.Close()
 
 	// close the old file handle and set to readonly
-	os.Chmod(b.datafile.Name(), 0444)
-	b.datafile.Close()
+	os.Chmod(b.activeDatafile.Name(), 0444)
+	b.activeDatafile.Close()
 
 	// set the new dataFile and reset the writePos
-	b.datafile = newDatafile
-	b.writePos = 0
+	b.activeDatafile = newDatafile
+	b.writePosition = 0
 
 	return nil
 }
 
 func (b *Bitcask) syncWrite() error {
 	// need to add logic to handle Always vs Interval
-	if err := b.datafile.Sync(); err != nil {
+	if err := b.activeDatafile.Sync(); err != nil {
 		return fmt.Errorf("syncWrite() failed: %v", err)
 	}
 	return nil

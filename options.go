@@ -39,16 +39,8 @@ type MergePolicy struct {
 	DeadByteThreshold uint64 // Minimum dead bytes required to trigger a merge.
 }
 
-// KeyMapValue represents the location and metadata of a key in a data file.
-type KeyMapValue struct {
-	FileId    uint16
-	ValueSize uint32
-	RecordPos uint32
-	Tstamp    uint32
-}
-
 type bitcaskOpts struct {
-	RootDir      string
+	ParentDir    string
 	DataDir      string
 	MaxFileSize  uint64
 	MergePolicy  MergePolicy
@@ -56,8 +48,8 @@ type bitcaskOpts struct {
 }
 
 var defaultOpts = bitcaskOpts{
-	RootDir:     ".",
-	MaxFileSize: uint64(2 * 1024 * 1024 * 1024),
+	ParentDir:   ".",
+	MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
 	MergePolicy: MergePolicy{
 		Strategy:          MergeStrategyUnrestricted,
 		Interval:          3 * time.Minute,
@@ -76,7 +68,7 @@ type Option func(*Bitcask)
 // The default value is ".".
 func WithRootDir(dir string) Option {
 	return func(b *Bitcask) {
-		b.opts.RootDir = dir
+		b.opts.ParentDir = dir
 	}
 }
 

@@ -81,7 +81,7 @@ func TestNew(t *testing.T) {
 			},
 			want: &Bitcask{
 				opts: bitcaskOpts{
-					RootDir:     filepath.Join(tempDir, "bitcask"),
+					ParentDir:   filepath.Join(tempDir, "bitcask"),
 					DataDir:     filepath.Join(tempDir, "bitcask", "data"),
 					MaxFileSize: 999,
 					MergePolicy: MergePolicy{

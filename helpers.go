@@ -10,13 +10,16 @@ import (
 )
 
 // dataFilePath returns the full path for a datafile with the corresponding Id.
+// TODO: I hate this name, should switch to something else probably
 func (b *Bitcask) dataFilePath(id uint16) string {
 	return filepath.Join(b.opts.DataDir, fmt.Sprintf("%05d.dat", id))
 }
 
 // activeFileId calls parseFileId passing in the active datafile.
+// TODO: I hate this name, should switch to something else probably
+// also maybe don't need it since we have parseFileId as a helper anyway
 func (b *Bitcask) activeFileId() (uint16, error) {
-	return parseFileId(b.datafile.Name())
+	return parseFileId(b.activeDatafile.Name())
 }
 
 // parseFileId returns the fileId for the named datafile.
