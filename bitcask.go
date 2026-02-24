@@ -237,13 +237,34 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 			// }
 
 			// not sure if we should create a new merge file each time we merge or if we should keep track of the merge file and append between merges
-			mergeFile, hintFile, err := b.newMergeFile()
+			// TODO: I dont think this is right. A merge file is just a data file afaik, we should probably just create a new datafile using the b.newDataFile() method
+			// separating them out adds more complexity since we'll inevitably need to add a rotateMergeFile() method which isn't ideal
+			// so just use .dat for the file extension on merge files and datafiles
+			// this isn't actually an issue since the only time this would come up is during resurrect call
+			// the resurrect will read over all .hint files and rebuild the key map
+			// the fileId for the record in the key map can be inferred since the .hint shares an id with the merge file
+			// so just treat them
+
+			// mergeFile, hintFile, err := b.newMergeFile()
+			// if err != nil {
+			// 	errMsg := fmt.Sprintf("mergeWorker() unexpected error setting up mergeFile: %v", err)
+			// 	b.logger.Error(errMsg)
+			// }
+
+			mergefile, err := b.newDataFile()
 			if err != nil {
-				errMsg := fmt.Sprintf("mergeWorker() unexpected error setting up mergeFile: %v", err)
-				b.logger.Error(errMsg)
+
+			}
+			var mergeFileOffset int
+
+			id, err := parseFileId(mergefile)
+			if err != nil {
 			}
 
-			var mergeFileOffset int
+			hintFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.hint", id))
+			hintFile, err := os.OpenFile(hintFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+			if err != nil {
+			}
 
 			entries, err := os.ReadDir(b.opts.DataDir)
 			if err != nil {
@@ -312,7 +333,7 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 						copy(record, key)
 						copy(record, value)
 
-						n, err := b.writeFile(mergeFile, record)
+						n, err := b.writeFile(mergefile, record)
 						if err != nil {
 
 						}
@@ -326,7 +347,7 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 						}
 
 						// update keyMap with new mergeFile fileId and record position
-						id, err := parseFileId(mergeFile)
+						id, err := parseFileId(mergefile)
 						if err != nil {
 
 						}
