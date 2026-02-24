@@ -1,8 +1,10 @@
 package bitcask
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -86,7 +88,8 @@ func New(opts ...Option) (*Bitcask, error) {
 	b.logger = slog.New(slog.NewJSONHandler(errorLog, nil))
 
 	// create file lock
-	lock, err := os.OpenFile(filepath.Join(parentDir, ".lock"), os.O_CREATE|os.O_RDWR, 0666)
+	// TODO: need to figure out the right perms for this, I don't think we want this to be read or write
+	lock, err := os.OpenFile(filepath.Join(parentDir, ".lock"), os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +127,7 @@ func (b *Bitcask) Put(k, v []byte) error {
 		}
 	}
 
-	fileId, err := b.activeFileId()
+	fileId, err := parseFileId(b.activeDatafile.Name())
 	if err != nil {
 		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.activeDatafile.Name()))
 	}
@@ -238,10 +241,84 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if b.deadBytes >= b.opts.MergePolicy.DeadByteThreshold {
+			// if b.deadBytes >= b.opts.MergePolicy.DeadByteThreshold {
+			// }
+			//
+			// if (uint8(b.deadBytes) / uint8(b.totalBytes)) >= b.opts.MergePolicy.FragThreshold {
+			// }
+
+			// create merge file and hintfile
+			mergeFile, err := os.OpenFile(b.dataFilePath(1), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+			if err != nil {
+
 			}
 
-			if (uint8(b.deadBytes) / uint8(b.totalBytes)) >= b.opts.MergePolicy.FragThreshold {
+			entries, err := os.ReadDir(b.opts.DataDir)
+			if err != nil {
+				errMsg := fmt.Sprintf("mergeWorker() unexpected error listing dir entries: %v", err)
+				b.logger.Error(errMsg)
+			}
+
+			for _, entry := range entries {
+				// check to see if this is the correct file type
+				if filepath.Ext(entry.Name()) != ".dat" || filepath.Ext(entry.Name()) != ".mdat" {
+					continue
+				}
+
+				func() { // extract into a function called ReadRecord
+					path := filepath.Join(b.opts.DataDir, entry.Name())
+					file, err := os.Open(path)
+					if err != nil {
+						errMsg := fmt.Sprintf("mergeWorker() unexpected error opening '%s' for reading: %v", entry.Name(), err)
+						b.logger.Error(errMsg)
+					}
+					defer file.Close()
+
+					// using this because it's more optimal to pull larger chunks into memory than to make multiple syscalls per request to the file
+					reader := bufio.NewReader(file)
+					buf := make([]byte, 0, 16)
+					id, err := parseFileId(file.Name())
+					if err != nil {
+						// TODO:
+						// failed conversion
+					}
+
+					for {
+						if _, err := io.ReadFull(reader, buf); err != nil {
+							// reached end EOF, return
+							if errors.Is(err, io.EOF) {
+								return
+							}
+							errMsg := fmt.Sprintf("mergeWorker() unexpected error reading META from '%s': %v", entry.Name(), err)
+							b.logger.Error(errMsg)
+						}
+
+						keySize := binary.BigEndian.Uint32(buf[8:12])
+						valueSize := binary.BigEndian.Uint32(buf[12:16])
+
+						key := make([]byte, keySize)
+						if _, err := io.ReadFull(reader, key); err != nil {
+							errMsg := fmt.Sprintf("mergeWorker() unexpected error reading KEY from '%s': %v", entry.Name(), err)
+							b.logger.Error(errMsg)
+						}
+
+						hint, ok := b.keys[string(key)]
+						if !ok || hint.FileId != id {
+							reader.Discard(int(valueSize))
+							continue
+						}
+
+						value := make([]byte, valueSize)
+						if _, err := io.ReadFull(reader, value); err != nil {
+							errMsg := fmt.Sprintf("mergeWorker() unexpected error reading VALUE from '%s': %v", entry.Name(), err)
+							b.logger.Error(errMsg)
+						}
+
+						// try to append to mergeFile (rotate if necessary)
+						// append to hintFile
+						// update keyMap with new mergeFile fileId and record position
+					}
+				}()
 			}
 		}
 	}
