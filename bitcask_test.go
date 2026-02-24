@@ -118,17 +118,25 @@ func TestNew(t *testing.T) {
 }
 
 func TestBitcask_Put(t *testing.T) {
+	type kvp struct {
+		k []byte
+		v []byte
+	}
+
 	tests := []struct {
 		name    string
-		k       []byte
-		v       []byte
+		kvs     []kvp
 		wantErr bool
 		setup   func(t *testing.T) *Bitcask
 	}{
 		{
-			name:    "vanilla: passing",
-			k:       []byte("key"),
-			v:       []byte("value"),
+			name: "vanilla: passing",
+			kvs: []kvp{
+				{
+					k: []byte("key"),
+					v: []byte("value"),
+				},
+			},
 			wantErr: false,
 			setup: func(t *testing.T) *Bitcask {
 				b, err := New(WithRootDir(t.TempDir()))
@@ -139,9 +147,46 @@ func TestBitcask_Put(t *testing.T) {
 			},
 		},
 		{
-			name:    "rotate datafile: passing",
-			k:       []byte("key"),
-			v:       []byte("value"),
+			name: "test many files: passing",
+			kvs: []kvp{
+				{
+					k: []byte("key1"),
+					v: []byte("value1"),
+				},
+				{
+					k: []byte("key2"),
+					v: []byte("value2"),
+				},
+				{
+					k: []byte("key3"),
+					v: []byte("value3"),
+				},
+				{
+					k: []byte("key4"),
+					v: []byte("value4"),
+				},
+				{
+					k: []byte("key5"),
+					v: []byte("value5"),
+				},
+			},
+			wantErr: false,
+			setup: func(t *testing.T) *Bitcask {
+				b, err := New(WithRootDir(t.TempDir()))
+				if err != nil {
+					t.Fatalf("could not construct receiver type: %v", err)
+				}
+				return b
+			},
+		},
+		{
+			name: "rotate datafile: passing",
+			kvs: []kvp{
+				{
+					k: []byte("key"),
+					v: []byte("value"),
+				},
+			},
 			wantErr: false,
 			setup: func(t *testing.T) *Bitcask {
 				b, err := New(WithRootDir(t.TempDir()))
@@ -156,15 +201,17 @@ func TestBitcask_Put(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := tt.setup(t)
-			gotErr := b.Put(tt.k, tt.v)
-			if gotErr != nil {
-				if !tt.wantErr {
-					t.Errorf("Put() failed: %v", gotErr)
+			for _, kv := range tt.kvs {
+				gotErr := b.Put(kv.k, kv.v)
+				if gotErr != nil {
+					if !tt.wantErr {
+						t.Errorf("Put() failed: %v", gotErr)
+					}
+					return
 				}
-				return
-			}
-			if tt.wantErr {
-				t.Fatal("Put() succeeded unexpectedly")
+				if tt.wantErr {
+					t.Fatal("Put() succeeded unexpectedly")
+				}
 			}
 		})
 	}
