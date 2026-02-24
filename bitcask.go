@@ -9,7 +9,6 @@ import (
 	"hash/crc32"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -23,7 +22,7 @@ type Bitcask struct {
 	mu             sync.RWMutex
 	activeDatafile *os.File
 	writePosition  uint64
-	keys           map[string]*ValuePtr // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
+	keys           map[string]*Hint // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
 	opts           bitcaskOpts
 	logger         *slog.Logger
 	totalBytes     uint64
@@ -32,9 +31,9 @@ type Bitcask struct {
 	cancel         context.CancelFunc
 }
 
-// ValuePtr represents the location and metadata of a key in a data file.
-type ValuePtr struct {
-	FileId         uint16
+// Hint represents the location and metadata of a key in a data file.
+type Hint struct {
+	FileId         uint64
 	ValueSize      uint32
 	RecordPosition uint32
 	Timestamp      uint32
@@ -44,7 +43,7 @@ type ValuePtr struct {
 func New(opts ...Option) (*Bitcask, error) {
 	b := Bitcask{
 		mu:   sync.RWMutex{},
-		keys: make(map[string]*ValuePtr),
+		keys: make(map[string]*Hint),
 		opts: defaultOpts,
 	}
 	b.ctx, b.cancel = context.WithCancel(context.Background())
@@ -69,13 +68,13 @@ func New(opts ...Option) (*Bitcask, error) {
 	b.opts.DataDir = dataDir
 
 	// create datafile and initialize write position
-	datafile, err := os.OpenFile(b.dataFilePath(1), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+	datafile, err := b.newDataFile()
 	if err != nil {
 		return nil, err
 	}
-	// Not closing this until b.Close is called
-
+	// Not closing this until b.Close is called or we need to rotate
 	b.activeDatafile = datafile
+
 	// b.writePosition = 0
 	// I don't think we need this since the 0 value of a uint64 is 0
 
@@ -119,50 +118,33 @@ func (b *Bitcask) Put(k, v []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// check to ensure we have enough space to write
-	if (b.writePosition + uint64(len(record))) > b.opts.MaxFileSize {
-		err := b.rotateDataFile()
-		if err != nil {
-			return fmt.Errorf("Put() failed: failed to rotate datafile: %v", err)
-		}
-	}
-
-	fileId, err := parseFileId(b.activeDatafile.Name())
+	n, err := b.writeFile(b.activeDatafile, record)
 	if err != nil {
-		return fmt.Errorf("Put() failed: failed to convert %s to int as fileId", filepath.Base(b.activeDatafile.Name()))
+		return fmt.Errorf("Put() failed: %w", err)
 	}
 
-	// construct ptr for key map
-	ptr := ValuePtr{
-		FileId:         uint16(fileId),
+	fileId, err := parseFileId(b.activeDatafile)
+	if err != nil {
+		return fmt.Errorf("Put() failed: %w", err)
+	}
+
+	// construct hint for key map
+	hint := Hint{
+		FileId:         fileId,
 		ValueSize:      uint32(len(v)),
 		RecordPosition: uint32(b.writePosition),
 		Timestamp:      timestamp,
 	}
-
-	// setup done, write record to datafile
-	n, err := b.activeDatafile.Write(record)
-	if err != nil {
-		return fmt.Errorf("Put() failed: failed to write to datafile %s: %v", filepath.Base(b.activeDatafile.Name()), err)
-	}
-
-	// Attempt to sync
-	if b.opts.SyncStrategy != SyncNone {
-		if err := b.syncWrite(); err != nil {
-			return fmt.Errorf("Put() failed: %w", err)
-		}
-	}
-
-	// increment writePos and update keyMap
-	b.writePosition += uint64(n)
 
 	// if we're overwriting a record, increment the deadBytes counter by the length of the previous key
 	if ptr, ok := b.keys[string(k)]; ok {
 		b.deadBytes += uint64((16 + len(k) + int(ptr.ValueSize)*1024*1024))
 	}
 
+	// update state
 	b.totalBytes += uint64(len(record) * 1024 * 1024)
-	b.keys[string(k)] = &ptr
+	b.writePosition += uint64(n)
+	b.keys[string(k)] = &hint
 
 	return nil
 }
@@ -178,7 +160,8 @@ func (b *Bitcask) Get(k []byte) ([]byte, error) {
 	}
 
 	// open dataFile
-	dataFile, err := os.Open(b.dataFilePath(hint.FileId))
+	dataFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.dat", hint.FileId))
+	dataFile, err := os.Open(dataFilePath)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +174,7 @@ func (b *Bitcask) Get(k []byte) ([]byte, error) {
 
 	record := make([]byte, 16+len(k)+int(hint.ValueSize))
 	if _, err := io.ReadFull(dataFile, record); err != nil {
-		return nil, fmt.Errorf("Get() failed: failed to read record: %v", err)
+		return nil, fmt.Errorf("Get() failed to read record: %v", err)
 	}
 
 	// verify checksum
@@ -248,10 +231,19 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 			// }
 
 			// create merge file and hintfile
-			mergeFile, err := os.OpenFile(b.dataFilePath(1), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
-			if err != nil {
+			// mergeFile, err := os.OpenFile(b.dataFilePath(1), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+			// if err != nil {
+			//
+			// }
 
+			// not sure if we should create a new merge file each time we merge or if we should keep track of the merge file and append between merges
+			mergeFile, hintFile, err := b.newMergeFile()
+			if err != nil {
+				errMsg := fmt.Sprintf("mergeWorker() unexpected error setting up mergeFile: %v", err)
+				b.logger.Error(errMsg)
 			}
+
+			var mergeFileOffset int
 
 			entries, err := os.ReadDir(b.opts.DataDir)
 			if err != nil {
@@ -276,15 +268,15 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 
 					// using this because it's more optimal to pull larger chunks into memory than to make multiple syscalls per request to the file
 					reader := bufio.NewReader(file)
-					buf := make([]byte, 0, 16)
-					id, err := parseFileId(file.Name())
+					metadata := make([]byte, 0, 16)
+					id, err := parseFileId(file)
 					if err != nil {
 						// TODO:
 						// failed conversion
 					}
 
 					for {
-						if _, err := io.ReadFull(reader, buf); err != nil {
+						if _, err := io.ReadFull(reader, metadata); err != nil {
 							// reached end EOF, return
 							if errors.Is(err, io.EOF) {
 								return
@@ -293,8 +285,8 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 							b.logger.Error(errMsg)
 						}
 
-						keySize := binary.BigEndian.Uint32(buf[8:12])
-						valueSize := binary.BigEndian.Uint32(buf[12:16])
+						keySize := binary.BigEndian.Uint32(metadata[8:12])
+						valueSize := binary.BigEndian.Uint32(metadata[12:16])
 
 						key := make([]byte, keySize)
 						if _, err := io.ReadFull(reader, key); err != nil {
@@ -302,8 +294,8 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 							b.logger.Error(errMsg)
 						}
 
-						hint, ok := b.keys[string(key)]
-						if !ok || hint.FileId != id {
+						valuePtr, ok := b.keys[string(key)]
+						if !ok || valuePtr.FileId != id {
 							reader.Discard(int(valueSize))
 							continue
 						}
@@ -315,8 +307,35 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 						}
 
 						// try to append to mergeFile (rotate if necessary)
-						// append to hintFile
+						record := make([]byte, 16+len(key)+len(value))
+						copy(record, metadata)
+						copy(record, key)
+						copy(record, value)
+
+						n, err := b.writeFile(mergeFile, record)
+						if err != nil {
+
+						}
+
+						hint := make([]byte, 16+len(key))
+						copy(hint, record[4:16])
+						copy(hint, key)
+
+						_, err = b.writeFile(hintFile, hint)
+						if err != nil {
+						}
+
 						// update keyMap with new mergeFile fileId and record position
+						id, err := parseFileId(mergeFile)
+						if err != nil {
+
+						}
+
+						valuePtr.FileId = id
+						valuePtr.RecordPosition = uint32(mergeFileOffset)
+
+						// finally update mergefile offset
+						mergeFileOffset += n
 					}
 				}()
 			}
@@ -324,44 +343,76 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 	}
 }
 
+func (b *Bitcask) newMergeFile() (*os.File, *os.File, error) {
+	id := time.Now().UnixNano()
+	mergeFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.mdat", id))
+	mergeFile, err := os.OpenFile(mergeFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	hintFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.hint", id))
+	hintFile, err := os.OpenFile(hintFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return mergeFile, hintFile, nil
+}
+
+func (b *Bitcask) newDataFile() (*os.File, error) {
+	id := time.Now().UnixNano()
+	path := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.dat", id))
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
+}
+
 func (b *Bitcask) rotateDataFile() error {
-	// copy the current fileId and increment by 1
-	fileId, err := parseFileId(b.activeDatafile.Name())
+	// create the new datafile
+	datafile, err := b.newDataFile()
 	if err != nil {
 		return err
 	}
-
-	// check to ensure we won't overflow before incrementing
-	if fileId == math.MaxUint16 {
-		return fmt.Errorf("rotateDataFile() failed: cannot exceed uint16 (65535 bytes) for unique file identifier: %d", fileId)
-	}
-	fileId++
-
-	// create the new datafile
-	newDatafilePath := b.dataFilePath(fileId)
-	newDatafile, err := os.OpenFile(newDatafilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
-	if err != nil {
-		return fmt.Errorf("rotateDataFile() failed: failed to create new dataFile: %v", err)
-	}
-	defer newDatafile.Close()
 
 	// close the old file handle and set to readonly
 	os.Chmod(b.activeDatafile.Name(), 0444)
 	b.activeDatafile.Close()
 
 	// set the new dataFile and reset the writePos
-	b.activeDatafile = newDatafile
+	b.activeDatafile = datafile
 	b.writePosition = 0
 
 	return nil
 }
 
-func (b *Bitcask) syncWrite() error {
-	// need to add logic to handle Always vs Interval
-	if err := b.activeDatafile.Sync(); err != nil {
-		return fmt.Errorf("syncWrite() failed: %v", err)
+func (b *Bitcask) writeFile(file *os.File, record []byte) (int, error) {
+	stat, err := file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("writeDataFile() failed to get file stats: %v", err)
 	}
-	return nil
+
+	// check to ensure there's enough room to write
+	if uint64(stat.Size()+int64(len(record))) > b.opts.MaxFileSize {
+		err := b.rotateDataFile()
+		if err != nil {
+			return 0, fmt.Errorf("writeDataFile() failed to rotate datafile: %v", err)
+		}
+	}
+
+	// setup done, write record to datafile
+	n, err := file.Write(record)
+	if err != nil {
+		return 0, fmt.Errorf("writeDataFile() failed to write to datafile %s: %v", filepath.Base(b.activeDatafile.Name()), err)
+	}
+
+	// Attempt to sync
+	if b.opts.SyncStrategy != SyncNone {
+		// need to add logic to handle Always vs Interval
+		if err := b.activeDatafile.Sync(); err != nil {
+			return 0, fmt.Errorf("writeDataFile() failed: %w", err)
+		}
+	}
+
+	return n, nil
 }
 
 // TODO:

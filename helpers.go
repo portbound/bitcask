@@ -2,34 +2,24 @@ package bitcask
 
 import (
 	"encoding/binary"
-	"fmt"
 	"hash/crc32"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
 
-// dataFilePath returns the full path for a datafile with the corresponding Id.
-// TODO: I hate this name, should switch to something else probably
-func (b *Bitcask) dataFilePath(id uint16) string {
-	return filepath.Join(b.opts.DataDir, fmt.Sprintf("%05d.dat", id))
-}
-
-// activeFileId calls parseFileId passing in the active datafile.
-// TODO: I hate this name, should switch to something else probably
-// also maybe don't need it since we have parseFileId as a helper anyway
-func (b *Bitcask) activeFileId() (uint16, error) {
-	return parseFileId(b.activeDatafile.Name())
-}
-
 // parseFileId returns the fileId for the named datafile.
-func parseFileId(path string) (uint16, error) {
-	base := filepath.Base(path)
-	id, err := strconv.ParseUint(strings.TrimSuffix(base, ".dat"), 10, 16)
+func parseFileId(f *os.File) (uint64, error) {
+	base := filepath.Base(f.Name())
+	extension := filepath.Ext(base)
+
+	id, err := strconv.ParseUint(strings.TrimSuffix(base, extension), 10, 64)
 	if err != nil {
 		return 0, err
 	}
-	return uint16(id), nil
+
+	return uint64(id), nil
 }
 
 // encodeRecord encodes the record using the Bitcask record encoding protocol and returns a byte slice representing the record in the on-disk format..
