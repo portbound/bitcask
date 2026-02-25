@@ -55,7 +55,7 @@ func Test_encodeRecord(t *testing.T) {
 	}
 }
 
-func TestNew(t *testing.T) {
+func TestConnect(t *testing.T) {
 	tempDir := t.TempDir()
 	tests := []struct {
 		name string // description of this test case
@@ -100,18 +100,18 @@ func TestNew(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, gotErr := New(tt.opts...)
+			got, gotErr := Connect(tt.opts...)
 			if gotErr != nil {
 				if !tt.wantErr {
-					t.Errorf("New() failed: %v", gotErr)
+					t.Errorf("Connect(): failed: %v", gotErr)
 				}
 				return
 			}
 			if tt.wantErr {
-				t.Fatal("New() succeeded unexpectedly")
+				t.Fatal("Connect(): succeeded unexpectedly")
 			}
 			if got.opts != tt.want.opts {
-				t.Fatalf("New() failed, got: %v, want: %v", got.opts, tt.want.opts)
+				t.Fatalf("Connect(): failed, got: %v, want: %v", got.opts, tt.want.opts)
 			}
 		})
 	}
@@ -139,7 +139,7 @@ func TestBitcask_Put(t *testing.T) {
 			},
 			wantErr: false,
 			setup: func(t *testing.T) *Bitcask {
-				b, err := New(WithRootDir(t.TempDir()))
+				b, err := Connect(WithRootDir(t.TempDir()))
 				if err != nil {
 					t.Fatalf("could not construct receiver type: %v", err)
 				}
@@ -172,7 +172,7 @@ func TestBitcask_Put(t *testing.T) {
 			},
 			wantErr: false,
 			setup: func(t *testing.T) *Bitcask {
-				b, err := New(WithRootDir(t.TempDir()))
+				b, err := Connect(WithRootDir(t.TempDir()))
 				if err != nil {
 					t.Fatalf("could not construct receiver type: %v", err)
 				}
@@ -189,7 +189,7 @@ func TestBitcask_Put(t *testing.T) {
 			},
 			wantErr: false,
 			setup: func(t *testing.T) *Bitcask {
-				b, err := New(WithRootDir(t.TempDir()))
+				b, err := Connect(WithRootDir(t.TempDir()))
 				if err != nil {
 					t.Fatalf("could not construct receiver type: %v", err)
 				}
@@ -233,7 +233,7 @@ func TestBitcask_Get(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, err := New(WithRootDir(t.TempDir()))
+			b, err := Connect(WithRootDir(t.TempDir()))
 			if err != nil {
 				t.Fatalf("could not construct receiver type: %v", err)
 			}
@@ -272,7 +272,7 @@ func TestBitcask_Delete(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, err := New(WithRootDir(t.TempDir()))
+			b, err := Connect(WithRootDir(t.TempDir()))
 			if err != nil {
 				t.Fatalf("could not construct receiver type: %v", err)
 			}

@@ -20,7 +20,7 @@ import (
 type Bitcask struct {
 	lock           *os.File
 	mu             sync.RWMutex
-	activeDatafile *os.File
+	activeDataFile *os.File
 	writePosition  uint64
 	keys           map[string]*Hint // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
 	opts           bitcaskOpts
@@ -39,8 +39,10 @@ type Hint struct {
 	Timestamp      uint32
 }
 
-// TODO: revisit the structure of New to make sure the order of logic makes sense
-func New(opts ...Option) (*Bitcask, error) {
+var ErrLocked = errors.New("failed to aquire lock, bitcask may be locked by another process")
+
+// TODO: revisit the structure of Connect to make sure the order of logic makes sense
+func Connect(opts ...Option) (*Bitcask, error) {
 	b := Bitcask{
 		mu:   sync.RWMutex{},
 		keys: make(map[string]*Hint),
@@ -51,6 +53,18 @@ func New(opts ...Option) (*Bitcask, error) {
 	// override defaultOpts with user preferences
 	for _, opt := range opts {
 		opt(&b)
+	}
+
+	// attempt to reconnect to an existing instance
+	err := b.reconnect()
+	switch {
+	case err == nil:
+		return &b, nil
+	case errors.Is(err, ErrLocked):
+		return nil, ErrLocked
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return nil, fmt.Errorf("failed to reconnect to bitcask: %w", err)
 	}
 
 	// create working parentDir
@@ -67,13 +81,13 @@ func New(opts ...Option) (*Bitcask, error) {
 	}
 	b.opts.DataDir = dataDir
 
-	// create datafile and initialize write position
-	datafile, err := b.newDataFile()
+	// create dataFile and initialize write position
+	dataFile, err := b.newDataFile()
 	if err != nil {
 		return nil, err
 	}
 	// Not closing this until b.Close is called or we need to rotate
-	b.activeDatafile = datafile
+	b.activeDataFile = dataFile
 
 	// b.writePosition = 0
 	// I don't think we need this since the 0 value of a uint64 is 0
@@ -92,13 +106,10 @@ func New(opts ...Option) (*Bitcask, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer lock.Close()
 	b.lock = lock
 
 	// aquire file lock
-	// TODO: need to figure out how to implement this lock to ensure when we resurrect a bitcask this is respected
-	err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-	if err != nil {
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		lock.Close()
 		return nil, err
 	}
@@ -118,12 +129,12 @@ func (b *Bitcask) Put(k, v []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	n, err := b.writeFile(b.activeDatafile, record)
+	n, err := b.writeFile(b.activeDataFile, record)
 	if err != nil {
 		return fmt.Errorf("Put() failed: %w", err)
 	}
 
-	fileId, err := parseFileId(b.activeDatafile)
+	fileId, err := parseFileId(b.activeDataFile)
 	if err != nil {
 		return fmt.Errorf("Put() failed: %w", err)
 	}
@@ -197,7 +208,8 @@ func (b *Bitcask) Delete(k []byte) error {
 func (b *Bitcask) Close() {
 	b.mu.Lock()
 	b.cancel()
-	b.activeDatafile.Close()
+	b.activeDataFile.Close()
+	b.lock.Close()
 	b.mu.Unlock()
 	// TODO: need to make sure we close all other resources
 	// should we return an error?
@@ -236,29 +248,15 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 			//
 			// }
 
-			// not sure if we should create a new merge file each time we merge or if we should keep track of the merge file and append between merges
-			// TODO: I dont think this is right. A merge file is just a data file afaik, we should probably just create a new datafile using the b.newDataFile() method
-			// separating them out adds more complexity since we'll inevitably need to add a rotateMergeFile() method which isn't ideal
-			// so just use .dat for the file extension on merge files and datafiles
-			// this isn't actually an issue since the only time this would come up is during resurrect call
-			// the resurrect will read over all .hint files and rebuild the key map
-			// the fileId for the record in the key map can be inferred since the .hint shares an id with the merge file
-			// so just treat them
-
-			// mergeFile, hintFile, err := b.newMergeFile()
-			// if err != nil {
-			// 	errMsg := fmt.Sprintf("mergeWorker() unexpected error setting up mergeFile: %v", err)
-			// 	b.logger.Error(errMsg)
-			// }
-
 			mergefile, err := b.newDataFile()
 			if err != nil {
-
+				// TODO: log error
 			}
 			var mergeFileOffset int
 
 			id, err := parseFileId(mergefile)
 			if err != nil {
+				// TODO: log error
 			}
 
 			hintFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.hint", id))
@@ -274,7 +272,7 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 
 			for _, entry := range entries {
 				// check to see if this is the correct file type
-				if filepath.Ext(entry.Name()) != ".dat" || filepath.Ext(entry.Name()) != ".mdat" {
+				if filepath.Ext(entry.Name()) != ".dat" {
 					continue
 				}
 
@@ -364,23 +362,6 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 	}
 }
 
-func (b *Bitcask) newMergeFile() (*os.File, *os.File, error) {
-	id := time.Now().UnixNano()
-	mergeFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.mdat", id))
-	mergeFile, err := os.OpenFile(mergeFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	hintFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.hint", id))
-	hintFile, err := os.OpenFile(hintFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return mergeFile, hintFile, nil
-}
-
 func (b *Bitcask) newDataFile() (*os.File, error) {
 	id := time.Now().UnixNano()
 	path := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.dat", id))
@@ -388,18 +369,18 @@ func (b *Bitcask) newDataFile() (*os.File, error) {
 }
 
 func (b *Bitcask) rotateDataFile() error {
-	// create the new datafile
-	datafile, err := b.newDataFile()
+	// create the new dataFile
+	dataFile, err := b.newDataFile()
 	if err != nil {
 		return err
 	}
 
 	// close the old file handle and set to readonly
-	os.Chmod(b.activeDatafile.Name(), 0444)
-	b.activeDatafile.Close()
+	os.Chmod(b.activeDataFile.Name(), 0444)
+	b.activeDataFile.Close()
 
 	// set the new dataFile and reset the writePos
-	b.activeDatafile = datafile
+	b.activeDataFile = dataFile
 	b.writePosition = 0
 
 	return nil
@@ -422,13 +403,13 @@ func (b *Bitcask) writeFile(file *os.File, record []byte) (int, error) {
 	// setup done, write record to datafile
 	n, err := file.Write(record)
 	if err != nil {
-		return 0, fmt.Errorf("writeDataFile() failed to write to datafile %s: %v", filepath.Base(b.activeDatafile.Name()), err)
+		return 0, fmt.Errorf("writeDataFile() failed to write to datafile %s: %v", filepath.Base(b.activeDataFile.Name()), err)
 	}
 
 	// Attempt to sync
 	if b.opts.SyncStrategy != SyncNone {
 		// need to add logic to handle Always vs Interval
-		if err := b.activeDatafile.Sync(); err != nil {
+		if err := b.activeDataFile.Sync(); err != nil {
 			return 0, fmt.Errorf("writeDataFile() failed: %w", err)
 		}
 	}
@@ -436,7 +417,86 @@ func (b *Bitcask) writeFile(file *os.File, record []byte) (int, error) {
 	return n, nil
 }
 
+func (b *Bitcask) rebuildKeys() error {
+	entries, err := os.ReadDir(b.opts.DataDir)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != ".hint" {
+			continue
+		}
+
+		hintFilePath := filepath.Join(b.opts.DataDir, entry.Name())
+		hintFile, err := os.Open(hintFilePath)
+		if err != nil {
+			return err
+		}
+		defer hintFile.Close()
+
+		for {
+			reader := bufio.NewReader(hintFile)
+			metadata := make([]byte, 0, 16)
+			fileId, err := parseFileId(hintFile)
+			if err != nil {
+				return err
+			}
+
+			if _, err := io.ReadFull(reader, metadata); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return err
+			}
+
+			timestamp := binary.BigEndian.Uint32(metadata[0:4])
+			keySize := binary.BigEndian.Uint32(metadata[4:8])
+			valueSize := binary.BigEndian.Uint32(metadata[8:12])
+			recordPosition := binary.BigEndian.Uint32(metadata[12:16])
+
+			key := make([]byte, keySize)
+			if _, err := io.ReadFull(reader, key); err != nil {
+				return err
+			}
+
+			b.keys[string(key)] = &Hint{
+				FileId:         fileId,
+				ValueSize:      valueSize,
+				RecordPosition: recordPosition,
+				Timestamp:      timestamp,
+			}
+		}
+	}
+
+	return nil
+}
+
+func (b *Bitcask) reconnect() error {
+	lockFilePath := filepath.Join(b.opts.ParentDir, ".lock")
+	_, err := os.Stat(lockFilePath)
+	if err != nil {
+		return err
+	}
+
+	lock, err := os.Open(lockFilePath)
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return err
+	}
+	b.lock = lock
+
+	if err := b.rebuildKeys(); err != nil {
+		return err
+	}
+
+	if b.opts.MergePolicy.Strategy != MergeStrategyNever {
+		go b.mergeWorker(b.ctx)
+	}
+
+	return nil
+}
+
 // TODO:
-// do we need a ticker for the fragworker? or should it just always walk the dir?
-// should mergeRequests be buffered or unbuffered?
-// need to build a resurrect func to handle rebuilding keyMap from disk after crash
+// enforce value size limit of 64kb and a key size limit of 64b
+// check b.CLose
