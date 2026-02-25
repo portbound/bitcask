@@ -9,9 +9,12 @@ const (
 	SyncStrategyUnset SyncStrategy = iota
 	// SyncNone relies on the OS to flush data to disk. Highest performance, lowest durability.
 	SyncNone
+
 	// SyncAlways flushes to disk after every write operation. Highest durability, lower performance.
 	SyncAlways
+
 	// TODO: need to determine how we want to implement the interval, if we want to implement at all... then update comment sentence
+
 	// SyncInterval flushes to disk at a regular time interval. (Not yet implemented).
 	SyncInterval
 )
@@ -23,8 +26,10 @@ const (
 	MergeStrategyUnset MergeStrategy = iota
 	// MergeStrategyUnrestricted allows merging any time merge trigger thresholds are met.
 	MergeStrategyUnrestricted
+
 	// MergeStrategyNever disables automatic merging entirely.
 	MergeStrategyNever
+
 	// MergeStrategyWindow restricts merging to a specific hour range (0 - 23).
 	MergeStrategyWindow
 )
@@ -40,7 +45,7 @@ type MergePolicy struct {
 }
 
 type bitcaskOpts struct {
-	ParentDir    string
+	WorkDir      string
 	DataDir      string
 	MaxFileSize  uint64
 	MergePolicy  MergePolicy
@@ -48,7 +53,7 @@ type bitcaskOpts struct {
 }
 
 var defaultOpts = bitcaskOpts{
-	ParentDir:   ".",
+	WorkDir:     ".",
 	MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
 	MergePolicy: MergePolicy{
 		Strategy:          MergeStrategyUnrestricted,
@@ -68,7 +73,7 @@ type Option func(*Bitcask)
 // The default value is ".".
 func WithRootDir(dir string) Option {
 	return func(b *Bitcask) {
-		b.opts.ParentDir = dir
+		b.opts.WorkDir = dir
 	}
 }
 

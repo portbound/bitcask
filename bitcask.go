@@ -22,7 +22,7 @@ type Bitcask struct {
 	mu             sync.RWMutex
 	activeDataFile *os.File
 	writePosition  uint64
-	keys           map[string]*Hint // maybe this can just be a value instead of a pointer? Would that technically make the lookups faster? I think this map would be significantly bigger though
+	keys           map[string]*Hint
 	opts           bitcaskOpts
 	logger         *slog.Logger
 	totalBytes     uint64
@@ -41,7 +41,8 @@ type Hint struct {
 
 var ErrLocked = errors.New("failed to aquire lock, bitcask may be locked by another process")
 
-// TODO: revisit the structure of Connect to make sure the order of logic makes sense
+// Connect opens a Bitcask database for the given options.
+// If a database does not exist at the specified path, it will be created.
 func Connect(opts ...Option) (*Bitcask, error) {
 	b := Bitcask{
 		mu:   sync.RWMutex{},
@@ -50,12 +51,10 @@ func Connect(opts ...Option) (*Bitcask, error) {
 	}
 	b.ctx, b.cancel = context.WithCancel(context.Background())
 
-	// override defaultOpts with user preferences
 	for _, opt := range opts {
 		opt(&b)
 	}
 
-	// attempt to reconnect to an existing instance
 	err := b.reconnect()
 	switch {
 	case err == nil:
@@ -147,12 +146,11 @@ func (b *Bitcask) Put(k, v []byte) error {
 		Timestamp:      timestamp,
 	}
 
-	// if we're overwriting a record, increment the deadBytes counter by the length of the previous key
+	// if we're overwriting a record, increment the deadBytes counter
 	if ptr, ok := b.keys[string(k)]; ok {
 		b.deadBytes += uint64((16 + len(k) + int(ptr.ValueSize)*1024*1024))
 	}
 
-	// update state
 	b.totalBytes += uint64(len(record) * 1024 * 1024)
 	b.writePosition += uint64(n)
 	b.keys[string(k)] = &hint
@@ -160,17 +158,18 @@ func (b *Bitcask) Put(k, v []byte) error {
 	return nil
 }
 
+// Get retrieves the value for a given key. It returns ErrKeyNotFound if the key
+// is not in the database. An error is returned if a disk read fails, or if
+// the data is found to be corrupted.
 func (b *Bitcask) Get(k []byte) ([]byte, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	// extract key
 	hint, ok := b.keys[string(k)]
 	if !ok {
 		return nil, fmt.Errorf("Get() failed: key %s not found", string(k))
 	}
 
-	// open dataFile
 	dataFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.dat", hint.FileId))
 	dataFile, err := os.Open(dataFilePath)
 	if err != nil {
@@ -178,7 +177,6 @@ func (b *Bitcask) Get(k []byte) ([]byte, error) {
 	}
 	defer dataFile.Close()
 
-	// seek to the record position and read it
 	if _, err = dataFile.Seek(int64(hint.RecordPosition), io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -188,24 +186,26 @@ func (b *Bitcask) Get(k []byte) ([]byte, error) {
 		return nil, fmt.Errorf("Get() failed to read record: %v", err)
 	}
 
-	// verify checksum
 	crc := make([]byte, 4)
 	binary.BigEndian.PutUint32(crc, crc32.ChecksumIEEE(record[4:]))
 	if !slices.Equal(record[0:4], crc) {
 		return nil, fmt.Errorf("Get() failed: checksum does not verify")
 	}
 
-	// return value
 	return record[16+len(k):], nil
 }
 
+// Delete removes a key from the database. It does this by writing a special
+// "tombstone" value for the provided key. This marks the record for deletion during a future merge.
 func (b *Bitcask) Delete(k []byte) error {
 	// using an empty slice for tombstone value
 	var v []byte
 	return b.Put(k, v)
 }
 
-func (b *Bitcask) Close() {
+// Close gracefully closes the database by syncing all data to disk, releasing file
+// handles, and unlocking the Bitcask for future connections.
+func (b *Bitcask) Close() error {
 	b.mu.Lock()
 	b.cancel()
 	b.activeDataFile.Close()
@@ -215,6 +215,7 @@ func (b *Bitcask) Close() {
 	// should we return an error?
 }
 
+// mergeWorker handles merge
 func (b *Bitcask) mergeWorker(ctx context.Context) {
 	ticker := time.NewTicker(b.opts.MergePolicy.Interval)
 	defer ticker.Stop()
@@ -290,8 +291,7 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 					metadata := make([]byte, 0, 16)
 					id, err := parseFileId(file)
 					if err != nil {
-						// TODO:
-						// failed conversion
+						// TODO: failed conversion
 					}
 
 					for {
@@ -362,141 +362,4 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 	}
 }
 
-func (b *Bitcask) newDataFile() (*os.File, error) {
-	id := time.Now().UnixNano()
-	path := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.dat", id))
-	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
-}
-
-func (b *Bitcask) rotateDataFile() error {
-	// create the new dataFile
-	dataFile, err := b.newDataFile()
-	if err != nil {
-		return err
-	}
-
-	// close the old file handle and set to readonly
-	os.Chmod(b.activeDataFile.Name(), 0444)
-	b.activeDataFile.Close()
-
-	// set the new dataFile and reset the writePos
-	b.activeDataFile = dataFile
-	b.writePosition = 0
-
-	return nil
-}
-
-func (b *Bitcask) writeFile(file *os.File, record []byte) (int, error) {
-	stat, err := file.Stat()
-	if err != nil {
-		return 0, fmt.Errorf("writeDataFile() failed to get file stats: %v", err)
-	}
-
-	// check to ensure there's enough room to write
-	if uint64(stat.Size()+int64(len(record))) > b.opts.MaxFileSize {
-		err := b.rotateDataFile()
-		if err != nil {
-			return 0, fmt.Errorf("writeDataFile() failed to rotate datafile: %v", err)
-		}
-	}
-
-	// setup done, write record to datafile
-	n, err := file.Write(record)
-	if err != nil {
-		return 0, fmt.Errorf("writeDataFile() failed to write to datafile %s: %v", filepath.Base(b.activeDataFile.Name()), err)
-	}
-
-	// Attempt to sync
-	if b.opts.SyncStrategy != SyncNone {
-		// need to add logic to handle Always vs Interval
-		if err := b.activeDataFile.Sync(); err != nil {
-			return 0, fmt.Errorf("writeDataFile() failed: %w", err)
-		}
-	}
-
-	return n, nil
-}
-
-func (b *Bitcask) rebuildKeys() error {
-	entries, err := os.ReadDir(b.opts.DataDir)
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		if filepath.Ext(entry.Name()) != ".hint" {
-			continue
-		}
-
-		hintFilePath := filepath.Join(b.opts.DataDir, entry.Name())
-		hintFile, err := os.Open(hintFilePath)
-		if err != nil {
-			return err
-		}
-		defer hintFile.Close()
-
-		for {
-			reader := bufio.NewReader(hintFile)
-			metadata := make([]byte, 0, 16)
-			fileId, err := parseFileId(hintFile)
-			if err != nil {
-				return err
-			}
-
-			if _, err := io.ReadFull(reader, metadata); err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				return err
-			}
-
-			timestamp := binary.BigEndian.Uint32(metadata[0:4])
-			keySize := binary.BigEndian.Uint32(metadata[4:8])
-			valueSize := binary.BigEndian.Uint32(metadata[8:12])
-			recordPosition := binary.BigEndian.Uint32(metadata[12:16])
-
-			key := make([]byte, keySize)
-			if _, err := io.ReadFull(reader, key); err != nil {
-				return err
-			}
-
-			b.keys[string(key)] = &Hint{
-				FileId:         fileId,
-				ValueSize:      valueSize,
-				RecordPosition: recordPosition,
-				Timestamp:      timestamp,
-			}
-		}
-	}
-
-	return nil
-}
-
-func (b *Bitcask) reconnect() error {
-	lockFilePath := filepath.Join(b.opts.ParentDir, ".lock")
-	_, err := os.Stat(lockFilePath)
-	if err != nil {
-		return err
-	}
-
-	lock, err := os.Open(lockFilePath)
-	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lock.Close()
-		return err
-	}
-	b.lock = lock
-
-	if err := b.rebuildKeys(); err != nil {
-		return err
-	}
-
-	if b.opts.MergePolicy.Strategy != MergeStrategyNever {
-		go b.mergeWorker(b.ctx)
-	}
-
-	return nil
-}
-
-// TODO:
-// enforce value size limit of 64kb and a key size limit of 64b
-// check b.CLose
+// TODO: check b.CLose
