@@ -12,11 +12,6 @@ const (
 
 	// SyncAlways flushes to disk after every write operation. Highest durability, lower performance.
 	SyncAlways
-
-	// TODO: need to determine how we want to implement the interval, if we want to implement at all... then update comment sentence
-
-	// SyncInterval flushes to disk at a regular time interval. (Not yet implemented).
-	SyncInterval
 )
 
 // MergeStrategy defines the strategy for reclaiming space from stale data files.
@@ -78,7 +73,7 @@ func WithRootDir(dir string) Option {
 }
 
 // WithMaxFileSize sets the maximum size a data file can reach before it is rotated.
-// The default value is 2GB.
+// The default value is 128MB.
 func WithMaxFileSize(size uint64) Option {
 	return func(b *Bitcask) {
 		b.opts.MaxFileSize = size
