@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
-	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -58,16 +57,39 @@ func Test_encodeRecord(t *testing.T) {
 func TestConnect(t *testing.T) {
 	tempDir := t.TempDir()
 	tests := []struct {
-		name string // description of this test case
-		// Named input parameters for target function.
-		opts    []Option
-		want    *Bitcask
-		wantErr bool
+		name         string
+		wantErr      bool
+		tryReconnect bool
+		opts         []Option
+		want         *Bitcask
+		setup        func(t *testing.T)
 	}{
 		{
-			name: "vanilla: passing",
+			name:    "default_opts",
+			wantErr: false,
+			opts:    []Option{WithWorkDir(tempDir)},
+			want: &Bitcask{
+				opts: bitcaskOpts{
+					Dir:         tempDir,
+					MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
+					MergePolicy: MergePolicy{
+						Strategy:          MergeStrategyUnrestricted,
+						Interval:          3 * time.Minute,
+						WindowStart:       0,
+						WindowEnd:         0,
+						FragThreshold:     60,
+						DeadByteThreshold: uint64(512 * 1024 * 1024), // 512MB
+					},
+					SyncStrategy: SyncAlways,
+				},
+			},
+			setup: func(t *testing.T) {},
+		},
+		{
+			name:    "custom_opts",
+			wantErr: false,
 			opts: []Option{
-				WithRootDir(tempDir),
+				WithWorkDir(tempDir),
 				WithMaxFileSize(999),
 				WithMergePolicy(MergePolicy{
 					Strategy:          MergeStrategyWindow,
@@ -81,8 +103,7 @@ func TestConnect(t *testing.T) {
 			},
 			want: &Bitcask{
 				opts: bitcaskOpts{
-					WorkDir:     filepath.Join(tempDir, "bitcask"),
-					DataDir:     filepath.Join(tempDir, "bitcask", "data"),
+					Dir:         tempDir,
 					MaxFileSize: 999,
 					MergePolicy: MergePolicy{
 						Strategy:          MergeStrategyWindow,
@@ -95,29 +116,87 @@ func TestConnect(t *testing.T) {
 					SyncStrategy: SyncNone,
 				},
 			},
+			setup: func(t *testing.T) {},
+		},
+		{
+			name:    "try_reconnect",
 			wantErr: false,
+			opts:    []Option{WithWorkDir(tempDir)},
+			want: &Bitcask{
+				opts: bitcaskOpts{
+					Dir:         tempDir,
+					MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
+					MergePolicy: MergePolicy{
+						Strategy:          MergeStrategyUnrestricted,
+						Interval:          3 * time.Minute,
+						WindowStart:       0,
+						WindowEnd:         0,
+						FragThreshold:     60,
+						DeadByteThreshold: uint64(512 * 1024 * 1024), // 512MB
+					},
+					SyncStrategy: SyncAlways,
+				},
+			},
+			setup: func(t *testing.T) {
+				b, err := Connect(WithWorkDir(tempDir))
+				if err != nil {
+					t.Fatalf("setup: %v", err)
+				}
+				defer b.Close()
+			},
+		},
+		{
+			name:    "try_reconnect_locked",
+			wantErr: true,
+			opts:    []Option{WithWorkDir(tempDir)},
+			want: &Bitcask{
+				opts: bitcaskOpts{
+					Dir:         tempDir,
+					MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
+					MergePolicy: MergePolicy{
+						Strategy:          MergeStrategyUnrestricted,
+						Interval:          3 * time.Minute,
+						WindowStart:       0,
+						WindowEnd:         0,
+						FragThreshold:     60,
+						DeadByteThreshold: uint64(512 * 1024 * 1024), // 512MB
+					},
+					SyncStrategy: SyncAlways,
+				},
+			},
+			setup: func(t *testing.T) {
+				_, err := Connect(WithWorkDir(tempDir))
+				if err != nil {
+					t.Fatalf("setup: %v", err)
+				}
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, gotErr := Connect(tt.opts...)
-			if gotErr != nil {
+			tt.setup(t)
+			b, err := Connect(tt.opts...)
+			if err != nil {
 				if !tt.wantErr {
-					t.Errorf("Connect(): failed: %v", gotErr)
+					t.Fatalf("unexpected error: %v", err)
 				}
 				return
 			}
+			defer b.Close()
+
 			if tt.wantErr {
-				t.Fatal("Connect(): succeeded unexpectedly")
+				t.Fatal("succeeded unexpectedly")
 			}
-			if got.opts != tt.want.opts {
-				t.Fatalf("Connect(): failed, got: %v, want: %v", got.opts, tt.want.opts)
+			if b.opts != tt.want.opts {
+				t.Fatalf("got: %+v, want: %+v", b.opts, tt.want.opts)
 			}
+
 		})
 	}
 }
 
 func TestBitcask_Put(t *testing.T) {
+	tempDir := t.TempDir()
 	type kvp struct {
 		k []byte
 		v []byte
@@ -127,10 +206,9 @@ func TestBitcask_Put(t *testing.T) {
 		name    string
 		kvs     []kvp
 		wantErr bool
-		setup   func(t *testing.T) *Bitcask
 	}{
 		{
-			name: "vanilla: passing",
+			name: "single_kvp",
 			kvs: []kvp{
 				{
 					k: []byte("key"),
@@ -138,16 +216,9 @@ func TestBitcask_Put(t *testing.T) {
 				},
 			},
 			wantErr: false,
-			setup: func(t *testing.T) *Bitcask {
-				b, err := Connect(WithRootDir(t.TempDir()))
-				if err != nil {
-					t.Fatalf("could not construct receiver type: %v", err)
-				}
-				return b
-			},
 		},
 		{
-			name: "test many files: passing",
+			name: "many_kvp",
 			kvs: []kvp{
 				{
 					k: []byte("key1"),
@@ -171,46 +242,47 @@ func TestBitcask_Put(t *testing.T) {
 				},
 			},
 			wantErr: false,
-			setup: func(t *testing.T) *Bitcask {
-				b, err := Connect(WithRootDir(t.TempDir()))
-				if err != nil {
-					t.Fatalf("could not construct receiver type: %v", err)
-				}
-				return b
-			},
 		},
 		{
-			name: "rotate datafile: passing",
+			name: "key_too_big",
 			kvs: []kvp{
 				{
-					k: []byte("key"),
+					k: make([]byte, 65),
 					v: []byte("value"),
 				},
 			},
-			wantErr: false,
-			setup: func(t *testing.T) *Bitcask {
-				b, err := Connect(WithRootDir(t.TempDir()))
-				if err != nil {
-					t.Fatalf("could not construct receiver type: %v", err)
-				}
-				return b
+			wantErr: true,
+		},
+		{
+			name: "value_too_big",
+			kvs: []kvp{
+				{
+					k: []byte("key"),
+					v: make([]byte, 65537),
+				},
 			},
+			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := tt.setup(t)
+			b, err := Connect(WithWorkDir(tempDir))
+			if err != nil {
+				t.Fatalf("construct receiver type: %v", err)
+			}
+			defer b.Close()
+
 			for _, kv := range tt.kvs {
 				gotErr := b.Put(kv.k, kv.v)
 				if gotErr != nil {
 					if !tt.wantErr {
-						t.Errorf("Put() failed: %v", gotErr)
+						t.Errorf("Put: %v", gotErr)
 					}
 					return
 				}
 				if tt.wantErr {
-					t.Fatal("Put() succeeded unexpectedly")
+					t.Fatal("succeeded unexpectedly")
 				}
 			}
 		})
@@ -218,42 +290,51 @@ func TestBitcask_Put(t *testing.T) {
 }
 
 func TestBitcask_Get(t *testing.T) {
+	tempDir := t.TempDir()
 	tests := []struct {
 		name    string
 		key     []byte
 		want    []byte
 		wantErr bool
+		setup   func(t *testing.T)
 	}{
 		{
-			name:    "vanilla: passing",
+			name:    "key_exist",
 			key:     []byte("key"),
 			want:    []byte("value"),
 			wantErr: false,
 		},
+		{
+			name:    "key_not_exist",
+			key:     []byte("foo"),
+			want:    []byte("value"),
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, err := Connect(WithRootDir(t.TempDir()))
+			b, err := Connect(WithWorkDir(tempDir))
 			if err != nil {
-				t.Fatalf("could not construct receiver type: %v", err)
+				t.Fatalf("construct receiver type: %v", err)
 			}
+			defer b.Close()
 
 			if err := b.Put([]byte("key"), []byte("value")); err != nil {
-				t.Fatalf("failed to initialize bitcask with dummy data")
+				t.Fatalf("initialize bitcask with dummy data: %v", err)
 			}
 
 			got, gotErr := b.Get(tt.key)
 			if gotErr != nil {
 				if !tt.wantErr {
-					t.Errorf("Get() failed: %v", gotErr)
+					t.Errorf("Get: %v", gotErr)
 				}
 				return
 			}
 			if tt.wantErr {
-				t.Fatal("Get() succeeded unexpectedly")
+				t.Fatal("succeeded unexpectedly")
 			}
 			if !slices.Equal(got, tt.want) {
-				t.Errorf("Get failed(): got %v, want %v", got, tt.want)
+				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -266,28 +347,38 @@ func TestBitcask_Delete(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "vanilla: passing",
-			k:    []byte("key"),
+			name:    "key_exist",
+			k:       []byte("key"),
+			wantErr: false,
+		},
+		{
+			name:    "key_not_exist",
+			k:       []byte("foo"),
+			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, err := Connect(WithRootDir(t.TempDir()))
+			b, err := Connect(WithWorkDir(t.TempDir()))
 			if err != nil {
-				t.Fatalf("could not construct receiver type: %v", err)
+				t.Fatalf("construct receiver type: %v", err)
 			}
+			defer b.Close()
+
 			if err := b.Put([]byte("key"), []byte("value")); err != nil {
-				t.Fatalf("failed to initialize bitcask with dummy data")
+				t.Fatalf("initialize bitcask with dummy data: %v", err)
 			}
+
 			gotErr := b.Delete(tt.k)
 			if gotErr != nil {
 				if !tt.wantErr {
-					t.Errorf("Delete() failed: %v", gotErr)
+					t.Errorf("Delete: %v", gotErr)
 				}
 				return
 			}
+
 			if tt.wantErr {
-				t.Fatal("Delete() succeeded unexpectedly")
+				t.Fatal("succeeded unexpectedly")
 			}
 		})
 	}
