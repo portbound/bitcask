@@ -34,11 +34,11 @@ type MergeStrategy int
 // MergePolicy holds the configuration for the chosen merge policy.
 type MergePolicy struct {
 	Strategy          MergeStrategy
-	Interval          time.Duration
-	WindowStart       int    // Hour (0-23)
-	WindowEnd         int    // Hour (0-23)
-	FragThreshold     uint8  // Fragmentation percentage (0-100) to trigger a merge.
-	DeadByteThreshold uint64 // Minimum dead bytes required to trigger a merge.
+	Interval          time.Duration // How often merge thresholds are evaluated.
+	WindowStart       int           // Hour (0-23)
+	WindowEnd         int           // Hour (0-23)
+	FragThreshold     uint8         // Fragmentation percentage (0-100) to trigger a merge.
+	DeadByteThreshold uint64        // Minimum dead bytes required to trigger a merge.
 }
 
 type bitcaskOpts struct {
@@ -88,7 +88,7 @@ func WithMergePolicy(config MergePolicy) Option {
 	}
 }
 
-// WithSyncStrategy defines how frequently data is flushed to the physical disk.
+// WithSyncStrategy defines how frequently data is flushed to disk.
 // Using SyncAlways provides the highest durability but impacts write performance.
 // The default value is SyncAlways.
 func WithSyncStrategy(strategy SyncStrategy) Option {
