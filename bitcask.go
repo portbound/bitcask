@@ -48,8 +48,6 @@ type hint struct {
 	Timestamp      uint32
 }
 
-type FileType string
-
 var (
 	// ErrKeyTooLarge is returned when a key exceeds MaxKeySize
 	ErrKeyTooLarge = errors.New("key too large")
@@ -87,14 +85,29 @@ func Connect(opts ...Option) (*Bitcask, error) {
 		opt(&b)
 	}
 
-	parentDir := filepath.Join(b.opts.WorkDir, "bitcask")
-	if err := os.MkdirAll(parentDir, 0755); err != nil {
-		return nil, fmt.Errorf("create parent dir %s: %w", parentDir, err)
+	workDir := filepath.Join(b.opts.Dir, "bitcask")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return nil, fmt.Errorf("create parent dir %s: %w", workDir, err)
 	}
 
-	dataDir := filepath.Join(parentDir, "data")
+	lockPath := filepath.Join(workDir, ".lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("create lock file %s: %w", lockPath, err)
+	}
+	b.lock = lock
+
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("acquire file lock on %s: %w", lockPath, ErrLocked)
+		}
+		return nil, fmt.Errorf("acquire file lock on %s: %w", lockPath, err)
+	}
+
+	dataDir := filepath.Join(workDir, "data")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return nil, fmt.Errorf("create data dir %s: %w", parentDir, err)
+		return nil, fmt.Errorf("create data dir %s: %w", workDir, err)
 	}
 	b.dataDir = dataDir
 
@@ -104,25 +117,13 @@ func Connect(opts ...Option) (*Bitcask, error) {
 	}
 	b.activeDataFile = dataFile
 
-	logPath := filepath.Join(parentDir, "mergeWorker.log")
+	logPath := filepath.Join(workDir, "mergeWorker.log")
 	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("open log file %s: %w", logPath, err)
 	}
 	defer log.Close()
 	b.logger = slog.New(slog.NewJSONHandler(log, nil))
-
-	lockPath := filepath.Join(parentDir, ".lock")
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		return nil, fmt.Errorf("create lock file %s: %w", lockPath, err)
-	}
-	b.lock = lock
-
-	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lock.Close()
-		return nil, fmt.Errorf("acquire file lock on %s: %w", lockPath, err)
-	}
 
 	if err := b.rebuildKeys(); err != nil {
 		return nil, fmt.Errorf("rebuild keys: %w", err)
@@ -171,6 +172,9 @@ func (b *Bitcask) Put(k, v []byte) error {
 
 	n, err := b.activeDataFile.Write(record)
 	if err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return fmt.Errorf("write to data file %q: %w", b.activeDataFile.Name(), ErrDatabaseClosed)
+		}
 		return fmt.Errorf("write to data file %q: %w", b.activeDataFile.Name(), err)
 	}
 
@@ -228,7 +232,10 @@ func (b *Bitcask) Get(k []byte) ([]byte, error) {
 
 	record := make([]byte, 16+len(k)+int(hint.ValueSize))
 	if _, err := io.ReadFull(dataFile, record); err != nil {
-		return nil, fmt.Errorf("%w: failed to read record from %s: %w", ErrDataCorrupted, dataFilePath, err)
+		if errors.Is(err, os.ErrClosed) {
+			return nil, fmt.Errorf("read record from %s: %w", b.activeDataFile.Name(), ErrDatabaseClosed)
+		}
+		return nil, fmt.Errorf("%w: read record from %s: %w", ErrDataCorrupted, dataFilePath, err)
 	}
 
 	crc := make([]byte, 4)
@@ -335,7 +342,7 @@ func (b *Bitcask) newDataFile() (*os.File, error) {
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 }
 
-// rotateDataFile calls newDataFile and updates b to use the new file handle.
+// rotateDataFile calls newDataFile and updates b with the new file handle.
 func (b *Bitcask) rotateDataFile() error {
 	file, err := b.newDataFile()
 	if err != nil {
@@ -350,7 +357,7 @@ func (b *Bitcask) rotateDataFile() error {
 	return nil
 }
 
-// rotateMergeFile calls newDataFile and creates a hintFile before updating b
+// rotateMergeFile calls newDataFile and creates a new hintFile before updating b with the new file handles.
 func (b *Bitcask) rotateMergeFile() error {
 	mergeFile, err := b.newDataFile()
 	if err != nil {

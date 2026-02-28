@@ -42,14 +42,14 @@ type MergePolicy struct {
 }
 
 type bitcaskOpts struct {
-	WorkDir      string
+	Dir          string
 	MaxFileSize  uint64
 	MergePolicy  MergePolicy
 	SyncStrategy SyncStrategy
 }
 
 var defaultOpts = bitcaskOpts{
-	WorkDir:     ".",
+	Dir:         ".",
 	MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
 	MergePolicy: MergePolicy{
 		Strategy:          MergeStrategyUnrestricted,
@@ -69,7 +69,7 @@ type Option func(*Bitcask)
 // The default value is ".".
 func WithWorkDir(dir string) Option {
 	return func(b *Bitcask) {
-		b.opts.WorkDir = dir
+		b.opts.Dir = dir
 	}
 }
 
