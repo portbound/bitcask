@@ -40,13 +40,6 @@ type Bitcask struct {
 	cancel          context.CancelFunc
 }
 
-// record represents
-type record struct {
-	metadata uint16
-	key      []byte
-	value    []byte
-}
-
 // hint represents the location and metadata of a key in a data file.
 type hint struct {
 	FileId         uint64
@@ -94,18 +87,51 @@ func Connect(opts ...Option) (*Bitcask, error) {
 		opt(&b)
 	}
 
-	err := b.reconnect()
-	if err == nil {
-		return &b, nil
+	parentDir := filepath.Join(b.opts.WorkDir, "bitcask")
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return nil, fmt.Errorf("create parent dir %s: %w", parentDir, err)
 	}
 
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("reconnect: %w", err)
+	dataDir := filepath.Join(parentDir, "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("create data dir %s: %w", parentDir, err)
+	}
+	b.dataDir = dataDir
+
+	dataFile, err := b.newDataFile()
+	if err != nil {
+		return nil, fmt.Errorf("create initial data file: %w", err)
+	}
+	b.activeDataFile = dataFile
+
+	logPath := filepath.Join(parentDir, "mergeWorker.log")
+	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("open log file %s: %w", logPath, err)
+	}
+	defer log.Close()
+	b.logger = slog.New(slog.NewJSONHandler(log, nil))
+
+	lockPath := filepath.Join(parentDir, ".lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("create lock file %s: %w", lockPath, err)
+	}
+	b.lock = lock
+
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("acquire file lock on %s: %w", lockPath, err)
 	}
 
-	if err := b.new(); err != nil {
-		return nil, fmt.Errorf("initialize new bitcask: %w", err)
+	if err := b.rebuildKeys(); err != nil {
+		return nil, fmt.Errorf("rebuild keys: %w", err)
 	}
+
+	if b.opts.MergePolicy.Strategy != MergeStrategyNever {
+		go b.mergeWorker(b.ctx)
+	}
+
 	return &b, nil
 }
 
@@ -244,87 +270,6 @@ func (b *Bitcask) Close() error {
 	}
 
 	return errors.Join(errs...)
-}
-
-// new initializes a new Bitcask instance on disk. It creates the necessary
-// directory structure, prepares the initial active data file, and acquires a
-// file lock to ensure exclusive access. It returns an error if any of these
-// steps fail.
-func (b *Bitcask) new() error {
-	workDir := filepath.Join(b.opts.WorkDir, "bitcask")
-	if err := os.MkdirAll(workDir, 0755); err != nil {
-		return fmt.Errorf("create directory %s: %w", workDir, err)
-	}
-	b.opts.WorkDir = workDir
-
-	dataDir := filepath.Join(parentDir, "data")
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return fmt.Errorf("create data dir %s: %w", parentDir, err)
-	}
-	b.dataDir = dataDir
-
-	dataFile, err := b.newDataFile()
-	if err != nil {
-		return fmt.Errorf("create initial data file: %w", err)
-	}
-	b.activeDataFile = dataFile
-
-	logPath := filepath.Join(parentDir, "mergeWorker.log")
-	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
-	if err != nil {
-		return fmt.Errorf("open log file %s: %w", logPath, err)
-	}
-	defer log.Close()
-	b.logger = slog.New(slog.NewJSONHandler(log, nil))
-
-	lockPath := filepath.Join(parentDir, ".lock")
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		return fmt.Errorf("create lock file %s: %w", lockPath, err)
-	}
-	b.lock = lock
-
-	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lock.Close()
-		return fmt.Errorf("acquire file lock on %s: %w", lockPath, err)
-	}
-
-	if b.opts.MergePolicy.Strategy != MergeStrategyNever {
-		go b.mergeWorker(b.ctx)
-	}
-
-	return nil
-}
-
-// reconnect attempts to resurrect an existing Bitcask. It acquires the file lock
-// and rebuilds the key index from hint files. It returns os.ErrNotExist if the
-// lockfile is not found, signaling the caller to create a new instance.
-func (b *Bitcask) reconnect() error {
-	lockFilePath := filepath.Join(b.opts.WorkDir, "bitcask", ".lock")
-	_, err := os.Stat(lockFilePath)
-	if err != nil {
-		return fmt.Errorf("stat lock file %s: %w", lockFilePath, err)
-	}
-
-	lock, err := os.Open(lockFilePath)
-	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lock.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return ErrLocked
-		}
-		return fmt.Errorf("acquire file lock on %s: %w", lockFilePath, err)
-	}
-	b.lock = lock
-
-	if err := b.rebuildKeys(); err != nil {
-		return fmt.Errorf("rebuild keys: %w", err)
-	}
-
-	if b.opts.MergePolicy.Strategy != MergeStrategyNever {
-		go b.mergeWorker(b.ctx)
-	}
-
-	return nil
 }
 
 // rebuildKeys scans all hint files in the data directory to rebuild the in-memory key index when reconnect is called.
