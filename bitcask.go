@@ -153,11 +153,6 @@ func (b *Bitcask) Put(k, v []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	fileId, err := parseFileId(b.activeDataFile)
-	if err != nil {
-		return fmt.Errorf("parse file id: %w", err)
-	}
-
 	stat, err := b.activeDataFile.Stat()
 	if err != nil {
 		return fmt.Errorf("stat file %s: %w", b.activeDataFile.Name(), err)
@@ -168,6 +163,11 @@ func (b *Bitcask) Put(k, v []byte) error {
 		if err != nil {
 			return fmt.Errorf("rotate data file: %w", err)
 		}
+	}
+
+	fileId, err := parseFileId(b.activeDataFile)
+	if err != nil {
+		return fmt.Errorf("parse file id: %w", err)
 	}
 
 	n, err := b.activeDataFile.Write(record)
