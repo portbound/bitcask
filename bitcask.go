@@ -25,6 +25,7 @@ const (
 type Bitcask struct {
 	lock            *os.File
 	mu              sync.RWMutex
+	dataDir         string
 	activeDataFile  *os.File
 	activeMergeFile *os.File
 	activeHintFile  *os.File
@@ -188,7 +189,7 @@ func (b *Bitcask) Get(k []byte) ([]byte, error) {
 		return nil, ErrKeyNotFound
 	}
 
-	dataFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.dat", hint.FileId))
+	dataFilePath := filepath.Join(b.dataDir, fmt.Sprintf("%d.dat", hint.FileId))
 	dataFile, err := os.Open(dataFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("open data file %s: %w", dataFilePath, err)
@@ -256,11 +257,11 @@ func (b *Bitcask) new() error {
 	}
 	b.opts.WorkDir = workDir
 
-	dataDir := filepath.Join(b.opts.WorkDir, "data")
+	dataDir := filepath.Join(parentDir, "data")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return fmt.Errorf("create directory %s: %w", dataDir, err)
+		return fmt.Errorf("create data dir %s: %w", parentDir, err)
 	}
-	b.opts.DataDir = dataDir
+	b.dataDir = dataDir
 
 	dataFile, err := b.newDataFile()
 	if err != nil {
@@ -268,7 +269,7 @@ func (b *Bitcask) new() error {
 	}
 	b.activeDataFile = dataFile
 
-	logPath := filepath.Join(b.opts.WorkDir, "mergeWorker.log")
+	logPath := filepath.Join(parentDir, "mergeWorker.log")
 	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return fmt.Errorf("open log file %s: %w", logPath, err)
@@ -276,7 +277,7 @@ func (b *Bitcask) new() error {
 	defer log.Close()
 	b.logger = slog.New(slog.NewJSONHandler(log, nil))
 
-	lockPath := filepath.Join(workDir, ".lock")
+	lockPath := filepath.Join(parentDir, ".lock")
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
 		return fmt.Errorf("create lock file %s: %w", lockPath, err)
@@ -299,7 +300,7 @@ func (b *Bitcask) new() error {
 // and rebuilds the key index from hint files. It returns os.ErrNotExist if the
 // lockfile is not found, signaling the caller to create a new instance.
 func (b *Bitcask) reconnect() error {
-	lockFilePath := filepath.Join(b.opts.WorkDir, ".lock")
+	lockFilePath := filepath.Join(b.opts.WorkDir, "bitcask", ".lock")
 	_, err := os.Stat(lockFilePath)
 	if err != nil {
 		return fmt.Errorf("stat lock file %s: %w", lockFilePath, err)
@@ -328,9 +329,9 @@ func (b *Bitcask) reconnect() error {
 
 // rebuildKeys scans all hint files in the data directory to rebuild the in-memory key index when reconnect is called.
 func (b *Bitcask) rebuildKeys() error {
-	entries, err := os.ReadDir(b.opts.DataDir)
+	entries, err := os.ReadDir(b.dataDir)
 	if err != nil {
-		return fmt.Errorf("list data directory %s: %w", b.opts.DataDir, err)
+		return fmt.Errorf("list data directory %s: %w", b.dataDir, err)
 	}
 
 	for _, entry := range entries {
@@ -338,7 +339,7 @@ func (b *Bitcask) rebuildKeys() error {
 			continue
 		}
 
-		hintFilePath := filepath.Join(b.opts.DataDir, entry.Name())
+		hintFilePath := filepath.Join(b.dataDir, entry.Name())
 		hintFile, err := os.Open(hintFilePath)
 		if err != nil {
 			return fmt.Errorf("open hint file %s: %w", hintFilePath, err)
@@ -385,7 +386,7 @@ func (b *Bitcask) rebuildKeys() error {
 // newDataFile creates a new dataFile
 func (b *Bitcask) newDataFile() (*os.File, error) {
 	id := time.Now().UnixNano()
-	path := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.dat", id))
+	path := filepath.Join(b.dataDir, fmt.Sprintf("%d.dat", id))
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 }
 
@@ -416,7 +417,7 @@ func (b *Bitcask) rotateMergeFile() error {
 		return fmt.Errorf("parse file id: %w", err)
 	}
 
-	hintFilePath := filepath.Join(b.opts.DataDir, fmt.Sprintf("%d.hint", id))
+	hintFilePath := filepath.Join(b.dataDir, fmt.Sprintf("%d.hint", id))
 	hintFile, err := os.OpenFile(hintFilePath, os.O_APPEND|os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
 		os.Remove(mergeFile.Name())
@@ -467,7 +468,7 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 				continue
 			}
 
-			entries, err := os.ReadDir(b.opts.DataDir)
+			entries, err := os.ReadDir(b.dataDir)
 			if err != nil {
 				b.logger.Error("list data directory", "error", err)
 			}
@@ -477,7 +478,7 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 					continue
 				}
 
-				dataFilePath := filepath.Join(b.opts.DataDir, entry.Name())
+				dataFilePath := filepath.Join(b.dataDir, entry.Name())
 				if err := b.merge(dataFilePath); err != nil {
 					b.logger.Error("merge", "error", err)
 				}

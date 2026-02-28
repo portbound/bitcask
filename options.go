@@ -1,9 +1,8 @@
 package bitcask
 
-import "time"
-
-// SyncStrategy defines how data is flushed to disk to ensure durability.
-type SyncStrategy int
+import (
+	"time"
+)
 
 const (
 	SyncStrategyUnset SyncStrategy = iota
@@ -13,9 +12,6 @@ const (
 	// SyncAlways flushes to disk after every write operation. Highest durability, lower performance.
 	SyncAlways
 )
-
-// MergeStrategy defines the strategy for reclaiming space from stale data files.
-type MergeStrategy int
 
 const (
 	MergeStrategyUnset MergeStrategy = iota
@@ -29,6 +25,12 @@ const (
 	MergeStrategyWindow
 )
 
+// SyncStrategy defines how data is flushed to disk to ensure durability.
+type SyncStrategy int
+
+// MergeStrategy defines the strategy for reclaiming space from stale data files.
+type MergeStrategy int
+
 // MergePolicy holds the configuration for the chosen merge policy.
 type MergePolicy struct {
 	Strategy          MergeStrategy
@@ -41,7 +43,6 @@ type MergePolicy struct {
 
 type bitcaskOpts struct {
 	WorkDir      string
-	DataDir      string
 	MaxFileSize  uint64
 	MergePolicy  MergePolicy
 	SyncStrategy SyncStrategy
@@ -64,9 +65,9 @@ var defaultOpts = bitcaskOpts{
 // Option is a functional option for configuring a Bitcask instance.
 type Option func(*Bitcask)
 
-// WithRootDir sets the base directory where Bitcask will store its metadata and logs.
+// WithWorkDir sets the base directory where Bitcask will store its metadata and logs.
 // The default value is ".".
-func WithRootDir(dir string) Option {
+func WithWorkDir(dir string) Option {
 	return func(b *Bitcask) {
 		b.opts.WorkDir = dir
 	}
