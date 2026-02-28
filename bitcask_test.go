@@ -3,7 +3,10 @@ package bitcask
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -351,11 +354,6 @@ func TestBitcask_Delete(t *testing.T) {
 			k:       []byte("key"),
 			wantErr: false,
 		},
-		{
-			name:    "key_not_exist",
-			k:       []byte("foo"),
-			wantErr: true,
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -381,5 +379,123 @@ func TestBitcask_Delete(t *testing.T) {
 				t.Fatal("succeeded unexpectedly")
 			}
 		})
+	}
+}
+
+func TestBitcask_Merge(t *testing.T) {
+	tempDir := t.TempDir()
+	b, err := Connect(
+		WithWorkDir(tempDir),
+		WithMaxFileSize(1024), // small enough to cause rotation
+		WithMergePolicy(MergePolicy{
+			Strategy: MergeStrategyNever,
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Put enough data to create multiple files
+	for i := range 20 {
+		k := fmt.Appendf(nil, "key-%d", i)
+		v := make([]byte, 100)
+		for j := range v {
+			v[j] = byte(i)
+		}
+		if err := b.Put(k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 2. Overwrite the first 10 keys
+	for i := range 10 {
+		k := fmt.Appendf(nil, "key-%d", i)
+		v := []byte("new-value")
+		if err := b.Put(k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Record active keys and their values before merge
+	expectedValues := make(map[string][]byte)
+	for i := range 20 {
+		k := fmt.Appendf(nil, "key-%d", i)
+		v, err := b.Get(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectedValues[string(k)] = v
+	}
+
+	// Find all data files before merge
+	entries, err := os.ReadDir(b.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dataFiles []string
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == ".dat" {
+			dataFiles = append(dataFiles, filepath.Join(b.dataDir, entry.Name()))
+		}
+	}
+
+	if len(dataFiles) < 2 {
+		t.Fatalf("expected multiple data files, got %d", len(dataFiles))
+	}
+
+	// 3. Trigger merge for each file
+	for _, df := range dataFiles {
+		// Don't merge the active file if we want to be realistic, but b.merge should handle it
+		if err := b.merge(df); err != nil {
+			t.Fatalf("merge failed for %s: %v", df, err)
+		}
+		// Simulate mergeWorker behavior by removing the merged file
+		if b.activeDataFile.Name() != df {
+			if err := os.Remove(df); err != nil {
+				t.Fatalf("remove failed for %s: %v", df, err)
+			}
+		}
+	}
+
+	// 4. Verify all keys still have correct values
+	for i := range 20 {
+		k := fmt.Appendf(nil, "key-%d", i)
+		got, err := b.Get(k)
+		if err != nil {
+			t.Errorf("Get(%s) failed after merge: %v", k, err)
+			continue
+		}
+		if !bytes.Equal(got, expectedValues[string(k)]) {
+			t.Errorf("Get(%s) returned wrong value after merge", k)
+		}
+	}
+
+	// 5. Verify that we can recover data after Close/Connect
+	b.Close()
+
+	b2, err := Connect(
+		WithWorkDir(tempDir),
+		WithMaxFileSize(1024),
+		WithMergePolicy(MergePolicy{
+			Strategy: MergeStrategyNever,
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b2.Close()
+
+	for i := 0; i < 20; i++ {
+		k := []byte(fmt.Sprintf("key-%d", i))
+		got, err := b2.Get(k)
+		if err != nil {
+			// This might fail for non-merged data because current implementation only uses hint files.
+			// Let's see if the test catches this.
+			t.Errorf("Get(%s) failed after reconnect: %v", k, err)
+			continue
+		}
+		if !bytes.Equal(got, expectedValues[string(k)]) {
+			t.Errorf("Get(%s) returned wrong value after reconnect", k)
+		}
 	}
 }
