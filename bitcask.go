@@ -2,6 +2,7 @@ package bitcask
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -413,136 +414,211 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			b.mu.RLock()
 			deadByteThresholdExceeded := b.deadBytes >= b.opts.MergePolicy.DeadByteThreshold
 			fragThresholdExceeded := (b.deadBytes*100)/b.totalBytes >= uint64(b.opts.MergePolicy.FragThreshold)
+			b.mu.Unlock()
 
 			if !deadByteThresholdExceeded && !fragThresholdExceeded {
 				continue
 			}
 
-			entries, err := os.ReadDir(b.dataDir)
-			if err != nil {
-				b.logger.Error("list data directory", "error", err)
+			if err := b.merge(); err != nil {
 			}
 
-			for _, entry := range entries {
-				if filepath.Ext(entry.Name()) != ".dat" {
-					continue
-				}
-
-				dataFilePath := filepath.Join(b.dataDir, entry.Name())
-				if err := b.merge(dataFilePath); err != nil {
-					b.logger.Error("merge", "error", err)
-				}
-
-				if err := os.Remove(dataFilePath); err != nil {
-					b.logger.Error("remove data file", "error", err)
-				}
-			}
+			// entries, err := os.ReadDir(b.dataDir)
+			// if err != nil {
+			// 	b.logger.Error("list data directory", "error", err)
+			// }
+			//
+			// for _, entry := range entries {
+			// 	if filepath.Ext(entry.Name()) != ".dat" {
+			// 		continue
+			// 	}
+			//
+			// 	dataFilePath := filepath.Join(b.dataDir, entry.Name())
+			// 	if err := b.merge(dataFilePath); err != nil {
+			// 		b.logger.Error("merge", "error", err)
+			// 	}
+			//
+			// 	if err := os.Remove(dataFilePath); err != nil {
+			// 		b.logger.Error("remove data file", "error", err)
+			// 	}
+			// }
 		}
 	}
 }
 
-func (b *Bitcask) merge(dataFilePath string) error {
-	dataFile, err := os.Open(dataFilePath)
-	if err != nil {
-		return fmt.Errorf("open dataFile: %w", err)
-	}
-	defer dataFile.Close()
+func (b *Bitcask) merge() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-	if b.activeMergeFile == nil {
-		if err := b.rotateMergeFile(); err != nil {
-			return fmt.Errorf("initalize merge file: %w", err)
-		}
+	type mergeEntry struct {
+		key  string
+		hint *hint
 	}
 
-	reader := bufio.NewReader(dataFile)
-	metadata := make([]byte, 16)
-	dataFileId, err := parseFileId(dataFile)
-	if err != nil {
-		return fmt.Errorf("%q: parse file id: %w", dataFile.Name(), err)
+	mergeEntries := make([]*mergeEntry, 0, len(b.keys))
+	for k, h := range b.keys {
+		mergeEntries = append(mergeEntries, &mergeEntry{key: k, hint: h})
 	}
 
-	for {
-		if _, err := io.ReadFull(reader, metadata); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return fmt.Errorf("read metadata: %w", err)
+	slices.SortFunc(mergeEntries, func(a, b *mergeEntry) int {
+		if a.hint.FileId != b.hint.FileId {
+			return cmp.Compare(a.hint.FileId, b.hint.FileId)
 		}
+		return cmp.Compare(a.hint.RecordPosition, b.hint.RecordPosition)
+	})
 
-		keySize := (binary.BigEndian.Uint32(metadata[8:12]))
-		valueSize := (binary.BigEndian.Uint32(metadata[12:16]))
-
-		key := make([]byte, keySize)
-		if _, err := io.ReadFull(reader, key); err != nil {
-			return fmt.Errorf("read key: %w", err)
+	fileCache := make(map[uint64]*os.File)
+	defer func() {
+		for _, file := range fileCache {
+			file.Close()
 		}
+	}()
 
-		hint, ok := b.keys[string(key)]
-		if !ok || hint.FileId != dataFileId {
-			reader.Discard(int(valueSize))
-			continue
-		}
+	for _, entry := range mergeEntries {
+		recordSize := int64(16 + len(entry.key) + int(entry.hint.ValueSize))
 
-		stat, err := b.activeMergeFile.Stat()
-		if err != nil {
-			return fmt.Errorf("stat file %s: %w", b.activeMergeFile.Name(), err)
-		}
-
-		if uint64(stat.Size()+int64(len(metadata)+int(keySize+valueSize))) > b.opts.MaxFileSize {
-			err := b.rotateMergeFile()
-			if err != nil {
+		if b.activeMergeFile == nil || b.mergeFileOffset+recordSize > b.opts.MaxFileSize {
+			if err := b.rotateMergeFile(); err != nil {
 				return fmt.Errorf("rotate merge file: %w", err)
 			}
 		}
 
-		if _, err := b.activeMergeFile.Write(metadata); err != nil {
-			return fmt.Errorf("%q: write metadata: %w", b.activeMergeFile.Name(), err)
-		}
-
-		if _, err := b.activeMergeFile.Write(key); err != nil {
-			return fmt.Errorf("%q: write key: %w", b.activeMergeFile.Name(), err)
-		}
-
-		if _, err := io.CopyN(b.activeMergeFile, reader, int64(valueSize)); err != nil {
-			return fmt.Errorf("%q: copy value: %w", b.activeMergeFile.Name(), err)
-		}
-
-		if b.opts.SyncStrategy != SyncNone {
-			if err := b.activeMergeFile.Sync(); err != nil {
-				return fmt.Errorf("%q: sync: %w", b.activeMergeFile.Name(), err)
+		dataFile, ok := fileCache[entry.hint.FileId]
+		if !ok {
+			fileName := fmt.Sprintf("%d.dat", entry.hint.FileId)
+			path := filepath.Join(b.dataDir, fileName)
+			dataFile, err := os.Open(path)
+			if err != nil {
+				b.logger.Error("merge: could not open data file, skipping", "path", path, "error", err)
+				continue
 			}
+			fileCache[entry.hint.FileId] = dataFile
 		}
 
-		hintRecord := make([]byte, 16+len(key))
-		binary.BigEndian.PutUint32(hintRecord, hint.Timestamp)
-		offset := 4
-		binary.BigEndian.PutUint32(hintRecord[offset:], keySize)
-		offset += 4
-		binary.BigEndian.PutUint32(hintRecord[offset:], valueSize)
-		offset += 4
-		binary.BigEndian.PutUint32(hintRecord[offset:], uint32(b.mergeFileOffset))
-		offset += 4
-		copy(hintRecord[offset:], key)
-
-		if _, err = b.activeHintFile.Write(hintRecord); err != nil {
-			return fmt.Errorf("%q: write: %w", b.activeHintFile.Name(), err)
+		if _, err := dataFile.Seek(int64(entry.hint.RecordPosition), io.SeekStart); err != nil {
+			b.logger.Error("merge: could not seek in data file, skipping", "file", dataFile.Name(), "offset", entry.hint.RecordPosition, "error", err)
 		}
 
-		if b.opts.SyncStrategy != SyncNone {
-			if err := b.activeHintFile.Sync(); err != nil {
-				return fmt.Errorf("%q: sync: %w", b.activeHintFile.Name(), err)
-			}
-		}
-
-		mergeFileId, err := parseFileId(b.activeMergeFile)
+		n, err := io.CopyN(b.activeMergeFile, dataFile, recordSize)
 		if err != nil {
-			return fmt.Errorf("%q: parse file id: %w", dataFile.Name(), err)
+			return fmt.Errorf("copy %d bytes: %w", n, err)
 		}
-		hint.FileId = mergeFileId
-		hint.RecordPosition = uint32(b.mergeFileOffset)
-		b.mergeFileOffset += 16 + int(keySize+valueSize)
 
+		b.mergeFileOffset += n
 	}
+
+	if b.opts.SyncStrategy != SyncNone {
+		if err := b.activeHintFile.Sync(); err != nil {
+			b.logger.Error("merge: sync failed", "error", err)
+		}
+	}
+
+	return nil
 }
+
+// func (b *Bitcask) merge(dataFilePath string) error {
+// 	dataFile, err := os.Open(dataFilePath)
+// 	if err != nil {
+// 		return fmt.Errorf("open dataFile: %w", err)
+// 	}
+// 	defer dataFile.Close()
+//
+// 	if b.activeMergeFile == nil {
+// 		if err := b.rotateMergeFile(); err != nil {
+// 			return fmt.Errorf("initalize merge file: %w", err)
+// 		}
+// 	}
+//
+// 	reader := bufio.NewReader(dataFile)
+// 	metadata := make([]byte, 16)
+// 	dataFileId, err := parseFileId(dataFile)
+// 	if err != nil {
+// 		return fmt.Errorf("%q: parse file id: %w", dataFile.Name(), err)
+// 	}
+//
+// 	for {
+// 		if _, err := io.ReadFull(reader, metadata); err != nil {
+// 			if errors.Is(err, io.EOF) {
+// 				return nil
+// 			}
+// 			return fmt.Errorf("read metadata: %w", err)
+// 		}
+//
+// 		keySize := (binary.BigEndian.Uint32(metadata[8:12]))
+// 		valueSize := (binary.BigEndian.Uint32(metadata[12:16]))
+//
+// 		key := make([]byte, keySize)
+// 		if _, err := io.ReadFull(reader, key); err != nil {
+// 			return fmt.Errorf("read key: %w", err)
+// 		}
+//
+// 		hint, ok := b.keys[string(key)]
+// 		if !ok || hint.FileId != dataFileId {
+// 			reader.Discard(int(valueSize))
+// 			continue
+// 		}
+//
+// 		stat, err := b.activeMergeFile.Stat()
+// 		if err != nil {
+// 			return fmt.Errorf("stat file %s: %w", b.activeMergeFile.Name(), err)
+// 		}
+//
+// 		if uint64(stat.Size()+int64(len(metadata)+int(keySize+valueSize))) > b.opts.MaxFileSize {
+// 			err := b.rotateMergeFile()
+// 			if err != nil {
+// 				return fmt.Errorf("rotate merge file: %w", err)
+// 			}
+// 		}
+//
+// 		if _, err := b.activeMergeFile.Write(metadata); err != nil {
+// 			return fmt.Errorf("%q: write metadata: %w", b.activeMergeFile.Name(), err)
+// 		}
+//
+// 		if _, err := b.activeMergeFile.Write(key); err != nil {
+// 			return fmt.Errorf("%q: write key: %w", b.activeMergeFile.Name(), err)
+// 		}
+//
+// 		if _, err := io.CopyN(b.activeMergeFile, reader, int64(valueSize)); err != nil {
+// 			return fmt.Errorf("%q: copy value: %w", b.activeMergeFile.Name(), err)
+// 		}
+//
+// 		if b.opts.SyncStrategy != SyncNone {
+// 			if err := b.activeMergeFile.Sync(); err != nil {
+// 				return fmt.Errorf("%q: sync: %w", b.activeMergeFile.Name(), err)
+// 			}
+// 		}
+//
+// 		hintRecord := make([]byte, 16+len(key))
+// 		binary.BigEndian.PutUint32(hintRecord, hint.Timestamp)
+// 		offset := 4
+// 		binary.BigEndian.PutUint32(hintRecord[offset:], keySize)
+// 		offset += 4
+// 		binary.BigEndian.PutUint32(hintRecord[offset:], valueSize)
+// 		offset += 4
+// 		binary.BigEndian.PutUint32(hintRecord[offset:], uint32(b.mergeFileOffset))
+// 		offset += 4
+// 		copy(hintRecord[offset:], key)
+//
+// 		if _, err = b.activeHintFile.Write(hintRecord); err != nil {
+// 			return fmt.Errorf("%q: write: %w", b.activeHintFile.Name(), err)
+// 		}
+//
+// 		if b.opts.SyncStrategy != SyncNone {
+// 			if err := b.activeHintFile.Sync(); err != nil {
+// 				return fmt.Errorf("%q: sync: %w", b.activeHintFile.Name(), err)
+// 			}
+// 		}
+//
+// 		mergeFileId, err := parseFileId(b.activeMergeFile)
+// 		if err != nil {
+// 			return fmt.Errorf("%q: parse file id: %w", dataFile.Name(), err)
+// 		}
+// 		hint.FileId = mergeFileId
+// 		hint.RecordPosition = uint32(b.mergeFileOffset)
+// 		b.mergeFileOffset += 16 + int(keySize+valueSize)
+//
+// 	}
+// }
