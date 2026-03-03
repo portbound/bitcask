@@ -29,8 +29,8 @@ type Bitcask struct {
 	activeDataFile  *os.File
 	activeMergeFile *os.File
 	activeHintFile  *os.File
-	dataFileOffset  int
-	mergeFileOffset int
+	dataFileOffset  int64
+	mergeFileOffset int64
 	keys            map[string]*hint
 	opts            bitcaskOpts
 	logger          *slog.Logger

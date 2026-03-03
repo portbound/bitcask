@@ -43,14 +43,14 @@ type MergePolicy struct {
 
 type bitcaskOpts struct {
 	Dir          string
-	MaxFileSize  uint64
+	MaxFileSize  int64
 	MergePolicy  MergePolicy
 	SyncStrategy SyncStrategy
 }
 
 var defaultOpts = bitcaskOpts{
 	Dir:         ".",
-	MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
+	MaxFileSize: int64(128 * 1024 * 1024), // 128MB
 	MergePolicy: MergePolicy{
 		Strategy:          MergeStrategyUnrestricted,
 		Interval:          3 * time.Minute,
