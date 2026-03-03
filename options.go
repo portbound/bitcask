@@ -43,14 +43,14 @@ type MergePolicy struct {
 
 type bitcaskOpts struct {
 	Dir          string
-	MaxFileSize  uint64
+	MaxFileSize  int64
 	MergePolicy  MergePolicy
 	SyncStrategy SyncStrategy
 }
 
 var defaultOpts = bitcaskOpts{
 	Dir:         ".",
-	MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
+	MaxFileSize: int64(128 * 1024 * 1024), // 128MB
 	MergePolicy: MergePolicy{
 		Strategy:          MergeStrategyUnrestricted,
 		Interval:          3 * time.Minute,
@@ -75,7 +75,7 @@ func WithWorkDir(dir string) Option {
 
 // WithMaxFileSize sets the maximum size a data file can reach before it is rotated.
 // The default value is 128MB.
-func WithMaxFileSize(size uint64) Option {
+func WithMaxFileSize(size int64) Option {
 	return func(b *Bitcask) {
 		b.opts.MaxFileSize = size
 	}

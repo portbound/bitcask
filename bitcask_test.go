@@ -74,7 +74,7 @@ func TestConnect(t *testing.T) {
 			want: &Bitcask{
 				opts: bitcaskOpts{
 					Dir:         tempDir,
-					MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
+					MaxFileSize: int64(128 * 1024 * 1024), // 128MB
 					MergePolicy: MergePolicy{
 						Strategy:          MergeStrategyUnrestricted,
 						Interval:          3 * time.Minute,
@@ -128,7 +128,7 @@ func TestConnect(t *testing.T) {
 			want: &Bitcask{
 				opts: bitcaskOpts{
 					Dir:         tempDir,
-					MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
+					MaxFileSize: int64(128 * 1024 * 1024), // 128MB
 					MergePolicy: MergePolicy{
 						Strategy:          MergeStrategyUnrestricted,
 						Interval:          3 * time.Minute,
@@ -155,7 +155,7 @@ func TestConnect(t *testing.T) {
 			want: &Bitcask{
 				opts: bitcaskOpts{
 					Dir:         tempDir,
-					MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
+					MaxFileSize: int64(128 * 1024 * 1024), // 128MB
 					MergePolicy: MergePolicy{
 						Strategy:          MergeStrategyUnrestricted,
 						Interval:          3 * time.Minute,

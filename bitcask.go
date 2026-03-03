@@ -29,8 +29,8 @@ type Bitcask struct {
 	activeDataFile  *os.File
 	activeMergeFile *os.File
 	activeHintFile  *os.File
-	dataFileOffset  int
-	mergeFileOffset int
+	dataFileOffset  int64
+	mergeFileOffset int64
 	keys            map[string]*hint
 	opts            bitcaskOpts
 	logger          *slog.Logger
@@ -158,7 +158,7 @@ func (b *Bitcask) Put(k, v []byte) error {
 		return fmt.Errorf("stat file %s: %w", b.activeDataFile.Name(), err)
 	}
 
-	if uint64(stat.Size()+int64(len(record))) > b.opts.MaxFileSize {
+	if stat.Size()+int64(len(record)) > b.opts.MaxFileSize {
 		err := b.rotateDataFile()
 		if err != nil {
 			return fmt.Errorf("rotate data file: %w", err)
@@ -197,7 +197,7 @@ func (b *Bitcask) Put(k, v []byte) error {
 	}
 
 	b.totalBytes += uint64(len(record))
-	b.dataFileOffset += n
+	b.dataFileOffset += int64(n)
 	b.keys[string(k)] = &hint
 
 	return nil
@@ -490,7 +490,7 @@ func (b *Bitcask) merge(dataFilePath string) error {
 			return fmt.Errorf("stat file %s: %w", b.activeMergeFile.Name(), err)
 		}
 
-		if uint64(stat.Size()+int64(len(metadata)+int(keySize+valueSize))) > b.opts.MaxFileSize {
+		if stat.Size()+int64(len(metadata)+int(keySize+valueSize)) > b.opts.MaxFileSize {
 			err := b.rotateMergeFile()
 			if err != nil {
 				return fmt.Errorf("rotate merge file: %w", err)
@@ -542,7 +542,7 @@ func (b *Bitcask) merge(dataFilePath string) error {
 		}
 		hint.FileId = mergeFileId
 		hint.RecordPosition = uint32(b.mergeFileOffset)
-		b.mergeFileOffset += 16 + int(keySize+valueSize)
+		b.mergeFileOffset += 16 + int64(keySize+valueSize)
 
 	}
 }
