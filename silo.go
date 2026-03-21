@@ -1,4 +1,4 @@
-package bitcask
+package silo
 
 import (
 	"bufio"
@@ -22,7 +22,7 @@ const (
 	MaxValueSize = 64 * 1024 // 64kb
 )
 
-type Bitcask struct {
+type Silo struct {
 	lock            *os.File
 	mu              sync.RWMutex
 	dataDir         string
@@ -32,7 +32,7 @@ type Bitcask struct {
 	dataFileOffset  int64
 	mergeFileOffset int64
 	keys            map[string]*hint
-	opts            bitcaskOpts
+	opts            siloOpts
 	logger          *slog.Logger
 	totalBytes      uint64
 	deadBytes       uint64
@@ -68,24 +68,24 @@ var (
 	ErrDataCorrupted = errors.New("data corrupted")
 
 	// ErrLocked is returned when trying to open a database that is already locked.
-	ErrLocked = errors.New("bitcask is locked by another process")
+	ErrLocked = errors.New("silo is locked by another process")
 )
 
-// Connect opens a Bitcask database for the given options.
+// Connect opens a Silo database for the given options.
 // If a database does not exist at the specified path, it will be created.
-func Connect(opts ...Option) (*Bitcask, error) {
-	b := Bitcask{
+func Connect(opts ...Option) (*Silo, error) {
+	s := Silo{
 		mu:   sync.RWMutex{},
 		keys: make(map[string]*hint),
 		opts: defaultOpts,
 	}
-	b.ctx, b.cancel = context.WithCancel(context.Background())
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	for _, opt := range opts {
-		opt(&b)
+		opt(&s)
 	}
 
-	workDir := filepath.Join(b.opts.Dir, "bitcask")
+	workDir := filepath.Join(s.opts.Dir, "silo")
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		return nil, fmt.Errorf("create parent dir %s: %w", workDir, err)
 	}
@@ -95,7 +95,7 @@ func Connect(opts ...Option) (*Bitcask, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create lock file %s: %w", lockPath, err)
 	}
-	b.lock = lock
+	s.lock = lock
 
 	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		lock.Close()
@@ -109,13 +109,13 @@ func Connect(opts ...Option) (*Bitcask, error) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("create data dir %s: %w", workDir, err)
 	}
-	b.dataDir = dataDir
+	s.dataDir = dataDir
 
-	dataFile, err := b.newDataFile()
+	dataFile, err := s.newDataFile()
 	if err != nil {
 		return nil, fmt.Errorf("create initial data file: %w", err)
 	}
-	b.activeDataFile = dataFile
+	s.activeDataFile = dataFile
 
 	logPath := filepath.Join(workDir, "mergeWorker.log")
 	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
@@ -123,22 +123,22 @@ func Connect(opts ...Option) (*Bitcask, error) {
 		return nil, fmt.Errorf("open log file %s: %w", logPath, err)
 	}
 	defer log.Close()
-	b.logger = slog.New(slog.NewJSONHandler(log, nil))
+	s.logger = slog.New(slog.NewJSONHandler(log, nil))
 
-	if err := b.rebuildKeys(); err != nil {
+	if err := s.rebuildKeys(); err != nil {
 		return nil, fmt.Errorf("rebuild keys: %w", err)
 	}
 
-	if b.opts.MergePolicy.Strategy != MergeStrategyNever {
-		go b.mergeWorker(b.ctx)
+	if s.opts.MergePolicy.Strategy != MergeStrategyNever {
+		go s.mergeWorker(s.ctx)
 	}
 
-	return &b, nil
+	return &s, nil
 }
 
 // Put stores a key and value in the database. If the key already exists, its
 // value will be overwritten.
-func (b *Bitcask) Put(k, v []byte) error {
+func (s *Silo) Put(k, v []byte) error {
 	if len(k) > MaxKeySize {
 		return fmt.Errorf("%w: %d > %d", ErrKeyTooLarge, len(k), MaxKeySize)
 	}
@@ -150,55 +150,55 @@ func (b *Bitcask) Put(k, v []byte) error {
 	timestamp := uint32(time.Now().Unix())
 	record := encodeRecord(k, v, timestamp)
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	stat, err := b.activeDataFile.Stat()
+	stat, err := s.activeDataFile.Stat()
 	if err != nil {
-		return fmt.Errorf("stat file %s: %w", b.activeDataFile.Name(), err)
+		return fmt.Errorf("stat file %s: %w", s.activeDataFile.Name(), err)
 	}
 
-	if stat.Size()+int64(len(record)) > b.opts.MaxFileSize {
-		err := b.rotateDataFile()
+	if stat.Size()+int64(len(record)) > s.opts.MaxFileSize {
+		err := s.rotateDataFile()
 		if err != nil {
 			return fmt.Errorf("rotate data file: %w", err)
 		}
 	}
 
-	fileId, err := parseFileId(b.activeDataFile)
+	fileId, err := parseFileId(s.activeDataFile)
 	if err != nil {
 		return fmt.Errorf("parse file id: %w", err)
 	}
 
-	n, err := b.activeDataFile.Write(record)
+	n, err := s.activeDataFile.Write(record)
 	if err != nil {
 		if errors.Is(err, os.ErrClosed) {
-			return fmt.Errorf("write to data file %q: %w", b.activeDataFile.Name(), ErrDatabaseClosed)
+			return fmt.Errorf("write to data file %q: %w", s.activeDataFile.Name(), ErrDatabaseClosed)
 		}
-		return fmt.Errorf("write to data file %q: %w", b.activeDataFile.Name(), err)
+		return fmt.Errorf("write to data file %q: %w", s.activeDataFile.Name(), err)
 	}
 
-	if b.opts.SyncStrategy != SyncNone {
-		if err := b.activeDataFile.Sync(); err != nil {
-			return fmt.Errorf("sync data file %q: %w", b.activeDataFile.Name(), err)
+	if s.opts.SyncStrategy != SyncNone {
+		if err := s.activeDataFile.Sync(); err != nil {
+			return fmt.Errorf("sync data file %q: %w", s.activeDataFile.Name(), err)
 		}
 	}
 
 	hint := hint{
 		FileId:         fileId,
 		ValueSize:      uint32(len(v)),
-		RecordPosition: uint32(b.dataFileOffset),
+		RecordPosition: uint32(s.dataFileOffset),
 		Timestamp:      timestamp,
 	}
 
 	// if we're overwriting a record, increment the deadBytes counter
-	if ptr, ok := b.keys[string(k)]; ok {
-		b.deadBytes += uint64((16 + len(k) + int(ptr.ValueSize)))
+	if ptr, ok := s.keys[string(k)]; ok {
+		s.deadBytes += uint64((16 + len(k) + int(ptr.ValueSize)))
 	}
 
-	b.totalBytes += uint64(len(record))
-	b.dataFileOffset += int64(n)
-	b.keys[string(k)] = &hint
+	s.totalBytes += uint64(len(record))
+	s.dataFileOffset += int64(n)
+	s.keys[string(k)] = &hint
 
 	return nil
 }
@@ -206,11 +206,11 @@ func (b *Bitcask) Put(k, v []byte) error {
 // Get retrieves the value for a given key. It returns ErrKeyNotFound if the key
 // is not in the database. An error is returned if a disk read fails, or if
 // the data is found to be corrupted.
-func (b *Bitcask) Get(k []byte) ([]byte, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+func (s *Silo) Get(k []byte) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	hint, ok := b.keys[string(k)]
+	hint, ok := s.keys[string(k)]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrKeyNotFound, string(k))
 	}
@@ -219,7 +219,7 @@ func (b *Bitcask) Get(k []byte) ([]byte, error) {
 		return nil, ErrKeyNotFound
 	}
 
-	dataFilePath := filepath.Join(b.dataDir, fmt.Sprintf("%d.dat", hint.FileId))
+	dataFilePath := filepath.Join(s.dataDir, fmt.Sprintf("%d.dat", hint.FileId))
 	dataFile, err := os.Open(dataFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("open data file %s: %w", dataFilePath, err)
@@ -233,7 +233,7 @@ func (b *Bitcask) Get(k []byte) ([]byte, error) {
 	record := make([]byte, 16+len(k)+int(hint.ValueSize))
 	if _, err := io.ReadFull(dataFile, record); err != nil {
 		if errors.Is(err, os.ErrClosed) {
-			return nil, fmt.Errorf("read record from %s: %w", b.activeDataFile.Name(), ErrDatabaseClosed)
+			return nil, fmt.Errorf("read record from %s: %w", s.activeDataFile.Name(), ErrDatabaseClosed)
 		}
 		return nil, fmt.Errorf("%w: read record from %s: %w", ErrDataCorrupted, dataFilePath, err)
 	}
@@ -249,41 +249,41 @@ func (b *Bitcask) Get(k []byte) ([]byte, error) {
 
 // Delete removes a key from the database. It does this by writing a special
 // "tombstone" value for the provided key. This marks the record for deletion during a future merge.
-func (b *Bitcask) Delete(k []byte) error {
+func (s *Silo) Delete(k []byte) error {
 	// using an empty slice for tombstone value
 	var v []byte
-	return b.Put(k, v)
+	return s.Put(k, v)
 }
 
 // Close gracefully closes the database by syncing all data to disk, releasing file
-// handles, and unlocking the Bitcask for future connections.
-func (b *Bitcask) Close() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.cancel()
+// handles, and unlocking the Silo for future connections.
+func (s *Silo) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancel()
 
 	var errs []error
-	if b.activeDataFile != nil {
-		errs = append(errs, b.activeDataFile.Close())
+	if s.activeDataFile != nil {
+		errs = append(errs, s.activeDataFile.Close())
 	}
-	if b.activeMergeFile != nil {
-		errs = append(errs, b.activeMergeFile.Close())
+	if s.activeMergeFile != nil {
+		errs = append(errs, s.activeMergeFile.Close())
 	}
-	if b.activeHintFile != nil {
-		errs = append(errs, b.activeHintFile.Close())
+	if s.activeHintFile != nil {
+		errs = append(errs, s.activeHintFile.Close())
 	}
-	if b.lock != nil {
-		errs = append(errs, b.lock.Close())
+	if s.lock != nil {
+		errs = append(errs, s.lock.Close())
 	}
 
 	return errors.Join(errs...)
 }
 
 // rebuildKeys scans all hint files in the data directory to rebuild the in-memory key index when reconnect is called.
-func (b *Bitcask) rebuildKeys() error {
-	entries, err := os.ReadDir(b.dataDir)
+func (s *Silo) rebuildKeys() error {
+	entries, err := os.ReadDir(s.dataDir)
 	if err != nil {
-		return fmt.Errorf("list data directory %s: %w", b.dataDir, err)
+		return fmt.Errorf("list data directory %s: %w", s.dataDir, err)
 	}
 
 	for _, entry := range entries {
@@ -291,7 +291,7 @@ func (b *Bitcask) rebuildKeys() error {
 			continue
 		}
 
-		hintFilePath := filepath.Join(b.dataDir, entry.Name())
+		hintFilePath := filepath.Join(s.dataDir, entry.Name())
 		hintFile, err := os.Open(hintFilePath)
 		if err != nil {
 			return fmt.Errorf("open hint file %s: %w", hintFilePath, err)
@@ -323,7 +323,7 @@ func (b *Bitcask) rebuildKeys() error {
 				return fmt.Errorf("%w: read key from hint file %s: %w", ErrDataCorrupted, hintFilePath, err)
 			}
 
-			b.keys[string(key)] = &hint{
+			s.keys[string(key)] = &hint{
 				FileId:         fileId,
 				ValueSize:      valueSize,
 				RecordPosition: recordPosition,
@@ -336,30 +336,30 @@ func (b *Bitcask) rebuildKeys() error {
 }
 
 // newDataFile creates a new dataFile
-func (b *Bitcask) newDataFile() (*os.File, error) {
+func (s *Silo) newDataFile() (*os.File, error) {
 	id := time.Now().UnixNano()
-	path := filepath.Join(b.dataDir, fmt.Sprintf("%d.dat", id))
+	path := filepath.Join(s.dataDir, fmt.Sprintf("%d.dat", id))
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 }
 
 // rotateDataFile calls newDataFile and updates b with the new file handle.
-func (b *Bitcask) rotateDataFile() error {
-	file, err := b.newDataFile()
+func (s *Silo) rotateDataFile() error {
+	file, err := s.newDataFile()
 	if err != nil {
 		return err
 	}
 
-	os.Chmod(b.activeDataFile.Name(), 0444)
-	b.activeDataFile.Close()
-	b.activeDataFile = file
-	b.dataFileOffset = 0
+	os.Chmod(s.activeDataFile.Name(), 0444)
+	s.activeDataFile.Close()
+	s.activeDataFile = file
+	s.dataFileOffset = 0
 
 	return nil
 }
 
 // rotateMergeFile calls newDataFile and creates a new hintFile before updating b with the new file handles.
-func (b *Bitcask) rotateMergeFile() error {
-	mergeFile, err := b.newDataFile()
+func (s *Silo) rotateMergeFile() error {
+	mergeFile, err := s.newDataFile()
 	if err != nil {
 		return fmt.Errorf("create mergeFile: %w", err)
 	}
@@ -369,38 +369,38 @@ func (b *Bitcask) rotateMergeFile() error {
 		return fmt.Errorf("parse file id: %w", err)
 	}
 
-	hintFilePath := filepath.Join(b.dataDir, fmt.Sprintf("%d.hint", id))
+	hintFilePath := filepath.Join(s.dataDir, fmt.Sprintf("%d.hint", id))
 	hintFile, err := os.OpenFile(hintFilePath, os.O_APPEND|os.O_CREATE|os.O_EXCL|os.O_RDWR, 0666)
 	if err != nil {
 		os.Remove(mergeFile.Name())
 		return fmt.Errorf("create hint file: %w", err)
 	}
 
-	if b.activeMergeFile != nil {
-		os.Chmod(b.activeMergeFile.Name(), 0444)
-		b.activeMergeFile.Close()
+	if s.activeMergeFile != nil {
+		os.Chmod(s.activeMergeFile.Name(), 0444)
+		s.activeMergeFile.Close()
 
-		os.Chmod(b.activeHintFile.Name(), 0444)
-		b.activeHintFile.Close()
+		os.Chmod(s.activeHintFile.Name(), 0444)
+		s.activeHintFile.Close()
 	}
 
-	b.activeMergeFile = mergeFile
-	b.mergeFileOffset = 0
-	b.activeHintFile = hintFile
+	s.activeMergeFile = mergeFile
+	s.mergeFileOffset = 0
+	s.activeHintFile = hintFile
 
 	return nil
 }
 
 // mergeWorker handles merge
-func (b *Bitcask) mergeWorker(ctx context.Context) {
-	ticker := time.NewTicker(b.opts.MergePolicy.Interval)
+func (s *Silo) mergeWorker(ctx context.Context) {
+	ticker := time.NewTicker(s.opts.MergePolicy.Interval)
 	defer ticker.Stop()
 
 	for {
-		if b.opts.MergePolicy.Strategy == MergeStrategyWindow {
+		if s.opts.MergePolicy.Strategy == MergeStrategyWindow {
 			now := time.Now()
-			if b.opts.MergePolicy.WindowStart > now.Hour() || b.opts.MergePolicy.WindowEnd < now.Hour() {
-				target := time.Date(now.Year(), now.Month(), now.Day(), b.opts.MergePolicy.WindowStart, 0, 0, 0, now.Location())
+			if s.opts.MergePolicy.WindowStart > now.Hour() || s.opts.MergePolicy.WindowEnd < now.Hour() {
+				target := time.Date(now.Year(), now.Month(), now.Day(), s.opts.MergePolicy.WindowStart, 0, 0, 0, now.Location())
 				if target.Before(now) {
 					target = target.Add(24 * time.Hour)
 				}
@@ -413,16 +413,16 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			deadByteThresholdExceeded := b.deadBytes >= b.opts.MergePolicy.DeadByteThreshold
-			fragThresholdExceeded := (b.deadBytes*100)/b.totalBytes >= uint64(b.opts.MergePolicy.FragThreshold)
+			deadByteThresholdExceeded := s.deadBytes >= s.opts.MergePolicy.DeadByteThreshold
+			fragThresholdExceeded := (s.deadBytes*100)/s.totalBytes >= uint64(s.opts.MergePolicy.FragThreshold)
 
 			if !deadByteThresholdExceeded && !fragThresholdExceeded {
 				continue
 			}
 
-			entries, err := os.ReadDir(b.dataDir)
+			entries, err := os.ReadDir(s.dataDir)
 			if err != nil {
-				b.logger.Error("list data directory", "error", err)
+				s.logger.Error("list data directory", "error", err)
 			}
 
 			for _, entry := range entries {
@@ -430,28 +430,28 @@ func (b *Bitcask) mergeWorker(ctx context.Context) {
 					continue
 				}
 
-				dataFilePath := filepath.Join(b.dataDir, entry.Name())
-				if err := b.merge(dataFilePath); err != nil {
-					b.logger.Error("merge", "error", err)
+				dataFilePath := filepath.Join(s.dataDir, entry.Name())
+				if err := s.merge(dataFilePath); err != nil {
+					s.logger.Error("merge", "error", err)
 				}
 
 				if err := os.Remove(dataFilePath); err != nil {
-					b.logger.Error("remove data file", "error", err)
+					s.logger.Error("remove data file", "error", err)
 				}
 			}
 		}
 	}
 }
 
-func (b *Bitcask) merge(dataFilePath string) error {
+func (s *Silo) merge(dataFilePath string) error {
 	dataFile, err := os.Open(dataFilePath)
 	if err != nil {
 		return fmt.Errorf("open dataFile: %w", err)
 	}
 	defer dataFile.Close()
 
-	if b.activeMergeFile == nil {
-		if err := b.rotateMergeFile(); err != nil {
+	if s.activeMergeFile == nil {
+		if err := s.rotateMergeFile(); err != nil {
 			return fmt.Errorf("initalize merge file: %w", err)
 		}
 	}
@@ -479,39 +479,39 @@ func (b *Bitcask) merge(dataFilePath string) error {
 			return fmt.Errorf("read key: %w", err)
 		}
 
-		hint, ok := b.keys[string(key)]
+		hint, ok := s.keys[string(key)]
 		if !ok || hint.FileId != dataFileId {
 			reader.Discard(int(valueSize))
 			continue
 		}
 
-		stat, err := b.activeMergeFile.Stat()
+		stat, err := s.activeMergeFile.Stat()
 		if err != nil {
-			return fmt.Errorf("stat file %s: %w", b.activeMergeFile.Name(), err)
+			return fmt.Errorf("stat file %s: %w", s.activeMergeFile.Name(), err)
 		}
 
-		if stat.Size()+int64(len(metadata)+int(keySize+valueSize)) > b.opts.MaxFileSize {
-			err := b.rotateMergeFile()
+		if stat.Size()+int64(len(metadata)+int(keySize+valueSize)) > s.opts.MaxFileSize {
+			err := s.rotateMergeFile()
 			if err != nil {
 				return fmt.Errorf("rotate merge file: %w", err)
 			}
 		}
 
-		if _, err := b.activeMergeFile.Write(metadata); err != nil {
-			return fmt.Errorf("%q: write metadata: %w", b.activeMergeFile.Name(), err)
+		if _, err := s.activeMergeFile.Write(metadata); err != nil {
+			return fmt.Errorf("%q: write metadata: %w", s.activeMergeFile.Name(), err)
 		}
 
-		if _, err := b.activeMergeFile.Write(key); err != nil {
-			return fmt.Errorf("%q: write key: %w", b.activeMergeFile.Name(), err)
+		if _, err := s.activeMergeFile.Write(key); err != nil {
+			return fmt.Errorf("%q: write key: %w", s.activeMergeFile.Name(), err)
 		}
 
-		if _, err := io.CopyN(b.activeMergeFile, reader, int64(valueSize)); err != nil {
-			return fmt.Errorf("%q: copy value: %w", b.activeMergeFile.Name(), err)
+		if _, err := io.CopyN(s.activeMergeFile, reader, int64(valueSize)); err != nil {
+			return fmt.Errorf("%q: copy value: %w", s.activeMergeFile.Name(), err)
 		}
 
-		if b.opts.SyncStrategy != SyncNone {
-			if err := b.activeMergeFile.Sync(); err != nil {
-				return fmt.Errorf("%q: sync: %w", b.activeMergeFile.Name(), err)
+		if s.opts.SyncStrategy != SyncNone {
+			if err := s.activeMergeFile.Sync(); err != nil {
+				return fmt.Errorf("%q: sync: %w", s.activeMergeFile.Name(), err)
 			}
 		}
 
@@ -522,27 +522,27 @@ func (b *Bitcask) merge(dataFilePath string) error {
 		offset += 4
 		binary.BigEndian.PutUint32(hintRecord[offset:], valueSize)
 		offset += 4
-		binary.BigEndian.PutUint32(hintRecord[offset:], uint32(b.mergeFileOffset))
+		binary.BigEndian.PutUint32(hintRecord[offset:], uint32(s.mergeFileOffset))
 		offset += 4
 		copy(hintRecord[offset:], key)
 
-		if _, err = b.activeHintFile.Write(hintRecord); err != nil {
-			return fmt.Errorf("%q: write: %w", b.activeHintFile.Name(), err)
+		if _, err = s.activeHintFile.Write(hintRecord); err != nil {
+			return fmt.Errorf("%q: write: %w", s.activeHintFile.Name(), err)
 		}
 
-		if b.opts.SyncStrategy != SyncNone {
-			if err := b.activeHintFile.Sync(); err != nil {
-				return fmt.Errorf("%q: sync: %w", b.activeHintFile.Name(), err)
+		if s.opts.SyncStrategy != SyncNone {
+			if err := s.activeHintFile.Sync(); err != nil {
+				return fmt.Errorf("%q: sync: %w", s.activeHintFile.Name(), err)
 			}
 		}
 
-		mergeFileId, err := parseFileId(b.activeMergeFile)
+		mergeFileId, err := parseFileId(s.activeMergeFile)
 		if err != nil {
 			return fmt.Errorf("%q: parse file id: %w", dataFile.Name(), err)
 		}
 		hint.FileId = mergeFileId
-		hint.RecordPosition = uint32(b.mergeFileOffset)
-		b.mergeFileOffset += 16 + int64(keySize+valueSize)
+		hint.RecordPosition = uint32(s.mergeFileOffset)
+		s.mergeFileOffset += 16 + int64(keySize+valueSize)
 
 	}
 }

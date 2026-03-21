@@ -1,4 +1,4 @@
-package bitcask
+package silo
 
 import (
 	"time"
@@ -41,14 +41,14 @@ type MergePolicy struct {
 	DeadByteThreshold uint64        // Minimum dead bytes required to trigger a merge.
 }
 
-type bitcaskOpts struct {
+type siloOpts struct {
 	Dir          string
 	MaxFileSize  int64
 	MergePolicy  MergePolicy
 	SyncStrategy SyncStrategy
 }
 
-var defaultOpts = bitcaskOpts{
+var defaultOpts = siloOpts{
 	Dir:         ".",
 	MaxFileSize: int64(128 * 1024 * 1024), // 128MB
 	MergePolicy: MergePolicy{
@@ -62,13 +62,13 @@ var defaultOpts = bitcaskOpts{
 	SyncStrategy: SyncAlways,
 }
 
-// Option is a functional option for configuring a Bitcask instance.
-type Option func(*Bitcask)
+// Option is a functional option for configuring a Silo instance.
+type Option func(*Silo)
 
-// WithWorkDir sets the base directory where Bitcask will store its metadata and logs.
+// WithWorkDir sets the base directory where Silo will store its metadata and logs.
 // The default value is ".".
 func WithWorkDir(dir string) Option {
-	return func(b *Bitcask) {
+	return func(b *Silo) {
 		b.opts.Dir = dir
 	}
 }
@@ -76,14 +76,14 @@ func WithWorkDir(dir string) Option {
 // WithMaxFileSize sets the maximum size a data file can reach before it is rotated.
 // The default value is 128MB.
 func WithMaxFileSize(size int64) Option {
-	return func(b *Bitcask) {
+	return func(b *Silo) {
 		b.opts.MaxFileSize = size
 	}
 }
 
 // WithMergePolicy configures the strategy and thresholds for reclaiming disk space.
 func WithMergePolicy(config MergePolicy) Option {
-	return func(b *Bitcask) {
+	return func(b *Silo) {
 		b.opts.MergePolicy = config
 	}
 }
@@ -92,7 +92,7 @@ func WithMergePolicy(config MergePolicy) Option {
 // Using SyncAlways provides the highest durability but impacts write performance.
 // The default value is SyncAlways.
 func WithSyncStrategy(strategy SyncStrategy) Option {
-	return func(b *Bitcask) {
+	return func(b *Silo) {
 		b.opts.SyncStrategy = strategy
 	}
 }

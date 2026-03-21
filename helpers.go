@@ -1,4 +1,4 @@
-package bitcask
+package silo
 
 import (
 	"encoding/binary"
@@ -22,7 +22,7 @@ func parseFileId(f *os.File) (uint64, error) {
 	return uint64(id), nil
 }
 
-// encodeRecord encodes the record using the Bitcask record encoding protocol and returns a byte slice representing the record in the on-disk format..
+// encodeRecord encodes the record using the Silo record encoding protocol and returns a byte slice representing the record in the on-disk format..
 // The first 16 bytes of the record are made up of 4 uint32 chunks containing a checksum, a unix timestamp, the key size in bytes, and the value size bytes.
 // The remaining bytes in the record make up the afformentioned key and value, respectively.
 func encodeRecord(k, v []byte, tstamp uint32) []byte {

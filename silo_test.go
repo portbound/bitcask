@@ -1,4 +1,4 @@
-package bitcask
+package silo
 
 import (
 	"bytes"
@@ -64,15 +64,15 @@ func TestConnect(t *testing.T) {
 		wantErr      bool
 		tryReconnect bool
 		opts         []Option
-		want         *Bitcask
+		want         *Silo
 		setup        func(t *testing.T)
 	}{
 		{
 			name:    "default_opts",
 			wantErr: false,
 			opts:    []Option{WithWorkDir(tempDir)},
-			want: &Bitcask{
-				opts: bitcaskOpts{
+			want: &Silo{
+				opts: siloOpts{
 					Dir:         tempDir,
 					MaxFileSize: int64(128 * 1024 * 1024), // 128MB
 					MergePolicy: MergePolicy{
@@ -104,8 +104,8 @@ func TestConnect(t *testing.T) {
 				}),
 				WithSyncStrategy(SyncNone),
 			},
-			want: &Bitcask{
-				opts: bitcaskOpts{
+			want: &Silo{
+				opts: siloOpts{
 					Dir:         tempDir,
 					MaxFileSize: 999,
 					MergePolicy: MergePolicy{
@@ -125,8 +125,8 @@ func TestConnect(t *testing.T) {
 			name:    "try_reconnect",
 			wantErr: false,
 			opts:    []Option{WithWorkDir(tempDir)},
-			want: &Bitcask{
-				opts: bitcaskOpts{
+			want: &Silo{
+				opts: siloOpts{
 					Dir:         tempDir,
 					MaxFileSize: int64(128 * 1024 * 1024), // 128MB
 					MergePolicy: MergePolicy{
@@ -152,8 +152,8 @@ func TestConnect(t *testing.T) {
 			name:    "try_reconnect_locked",
 			wantErr: true,
 			opts:    []Option{WithWorkDir(tempDir)},
-			want: &Bitcask{
-				opts: bitcaskOpts{
+			want: &Silo{
+				opts: siloOpts{
 					Dir:         tempDir,
 					MaxFileSize: int64(128 * 1024 * 1024), // 128MB
 					MergePolicy: MergePolicy{
@@ -198,7 +198,7 @@ func TestConnect(t *testing.T) {
 	}
 }
 
-func TestBitcask_Put(t *testing.T) {
+func TestSilo_Put(t *testing.T) {
 	tempDir := t.TempDir()
 	type kvp struct {
 		k []byte
@@ -292,7 +292,7 @@ func TestBitcask_Put(t *testing.T) {
 	}
 }
 
-func TestBitcask_Get(t *testing.T) {
+func TestSilo_Get(t *testing.T) {
 	tempDir := t.TempDir()
 	tests := []struct {
 		name    string
@@ -323,7 +323,7 @@ func TestBitcask_Get(t *testing.T) {
 			defer b.Close()
 
 			if err := b.Put([]byte("key"), []byte("value")); err != nil {
-				t.Fatalf("initialize bitcask with dummy data: %v", err)
+				t.Fatalf("initialize silo with dummy data: %v", err)
 			}
 
 			got, gotErr := b.Get(tt.key)
@@ -343,7 +343,7 @@ func TestBitcask_Get(t *testing.T) {
 	}
 }
 
-func TestBitcask_Delete(t *testing.T) {
+func TestSilo_Delete(t *testing.T) {
 	tests := []struct {
 		name    string
 		k       []byte
@@ -364,7 +364,7 @@ func TestBitcask_Delete(t *testing.T) {
 			defer b.Close()
 
 			if err := b.Put([]byte("key"), []byte("value")); err != nil {
-				t.Fatalf("initialize bitcask with dummy data: %v", err)
+				t.Fatalf("initialize silo with dummy data: %v", err)
 			}
 
 			gotErr := b.Delete(tt.k)
@@ -382,7 +382,7 @@ func TestBitcask_Delete(t *testing.T) {
 	}
 }
 
-func TestBitcask_Merge(t *testing.T) {
+func TestSilo_Merge(t *testing.T) {
 	tempDir := t.TempDir()
 	b, err := Connect(
 		WithWorkDir(tempDir),
