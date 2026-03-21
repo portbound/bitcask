@@ -1,4 +1,4 @@
-# Bitcask
+# Silo
 
 A high-performance, log-structured key-value store implemented in Go, inspired by the original [Bitcask paper](https://riak.com/assets/bitcask-intro.pdf). 
 
@@ -14,7 +14,7 @@ Further implementation details can be found in the [riak docs](https://docs.riak
 ## Installation
 
 ```bash
-go get github.com/portbound/bitcask
+go get github.com/portbound/silo
 ```
 
 ## Quick Start
@@ -28,33 +28,33 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/portbound/bitcask"
+	"github.com/portbound/silo"
 )
 
 func main() {
-	// Connect to a Bitcask instance
-	b, err := bitcask.Connect()
+	// Connect to a Silo instance
+	s, err := silo.Connect()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer b.Close()
+	defer s.Close()
 
 	// Put a key-value pair
 	k := []byte("key")
 	v := []byte("value")
-	if err := b.Put(k, v); err != nil {
+	if err := s.Put(k, v); err != nil {
 		log.Fatal(err)
 	}
 
 	// Get the value
-	val, err := b.Get(key)
+	val, err := s.Get(key)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("Retrieved: %s", string(val))
 
 	// Delete the key
-	if err := b.Delete(k); err != nil {
+	if err := s.Delete(k); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -62,9 +62,9 @@ func main() {
 
 ## Configuration
 
-Bitcask can be configured using functional options during connection:
+Silo can be configured using functional options during connection:
 
-- `WithWorkDir(dir string)`: Sets the base directory where Bitcask will store its metadata and logs. 
+- `WithWorkDir(dir string)`: Sets the base directory where Silo will store its metadata and logs. 
 - `WithMaxFileSize(size uint64)`: Sets the maximum size a  data file can reach before it is rotated.
 - `WithSyncStrategy(strategy SyncStrategy)`: Defines how frequently data is flushed to disk. 
 - `WithMergePolicy(policy MergePolicy)`: Configures the strategy and thresholds for reclaiming disk space.
@@ -72,7 +72,7 @@ Bitcask can be configured using functional options during connection:
 ### Default Options 
 
 ```go 
-var defaultOpts = bitcaskOpts{
+var defaultOpts = siloOpts{
 	Dir:         ".",
 	MaxFileSize: uint64(128 * 1024 * 1024), // 128MB
 	MergePolicy: MergePolicy{
